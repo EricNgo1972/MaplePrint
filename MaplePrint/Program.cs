@@ -21,8 +21,24 @@ internal static class Program
     private const string LocalMutexName = @"Local\MaplePrint.SingleInstance";
 
     [STAThread]
-    private static void Main()
+    private static void Main(string[] args)
     {
+        // Checked before the single-instance lock: a diagnostic must be usable
+        // while the tray copy is running, which is exactly when someone needs it.
+        if (args.Length >= 2 && string.Equals(args[0], "--print-test", StringComparison.OrdinalIgnoreCase))
+        {
+            RunPrintTest(args[1], args.Length >= 3 ? args[2] : null, args.Length >= 4 ? args[3] : null);
+            return;
+        }
+
+        // Renders the calibration slip to a PNG without printing it — the
+        // "show me exactly what you would have sent" half of a support call.
+        if (args.Length >= 2 && string.Equals(args[0], "--render-test", StringComparison.OrdinalIgnoreCase))
+        {
+            RunRenderTest(args[1], args.Length >= 3 && int.TryParse(args[2], out var dots) ? dots : 0);
+            return;
+        }
+
         using var mutex = AcquireSingleInstanceLock(out var isFirstInstance);
         if (!isFirstInstance)
         {
@@ -39,6 +55,69 @@ internal static class Program
         Application.Run(new TrayApplicationContext());
 
         GC.KeepAlive(mutex);
+    }
+
+    private static void RunRenderTest(string outputPath, int dotWidth)
+    {
+        var resultPath = Path.Combine(Path.GetTempPath(), "mapleprint-selftest.txt");
+        var lines = new List<string> { $"render: {outputPath}" };
+
+        try
+        {
+            using var image = dotWidth > 0
+                ? Printing.TestDocuments.CalibrationImage(Environment.MachineName, dotWidth)
+                : Printing.TestDocuments.CalibrationImage(Environment.MachineName);
+
+            image.Save(outputPath, System.Drawing.Imaging.ImageFormat.Png);
+            lines.Add($"bitmap: {image.Width}x{image.Height} at {image.HorizontalResolution:0}dpi");
+            lines.Add("result: OK");
+        }
+        catch (Exception ex)
+        {
+            lines.Add($"result: {ex.GetType().Name}: {ex.Message}");
+        }
+
+        try { File.WriteAllLines(resultPath, lines); } catch { }
+    }
+
+    /// <summary>
+    /// Headless self-test: prints the calibration slip to a queue, optionally to
+    /// a file instead of paper, and leaves the outcome in
+    /// <c>%TEMP%\mapleprint-selftest.txt</c>.
+    ///
+    /// There is no console behind a WinExe, so the result goes to a file — which
+    /// suits the use it was written for: "run this line and send me what it
+    /// produced", without anyone having to drive the tray menu.
+    /// </summary>
+    private static void RunPrintTest(string queue, string? outputFile, string? paperSizeName)
+    {
+        var resultPath = Path.Combine(Path.GetTempPath(), "mapleprint-selftest.txt");
+        var lines = new List<string>
+        {
+            $"queue: {queue}",
+            $"output: {outputFile ?? "(paper)"}",
+            $"paper: {paperSizeName ?? "(driver default)"}"
+        };
+
+        try
+        {
+            using var image = Printing.TestDocuments.CalibrationImage(Environment.MachineName);
+            lines.Add($"bitmap: {image.Width}x{image.Height} at {image.HorizontalResolution:0}dpi");
+
+            var error = Printing.DocumentPrinter.Print(
+                queue, image, "MaplePrint self-test",
+                paperSizeName: paperSizeName,
+                note: n => lines.Add($"note: {n}"),
+                outputFile: outputFile);
+
+            lines.Add(error is null ? "result: OK" : $"result: {error}");
+        }
+        catch (Exception ex)
+        {
+            lines.Add($"result: {ex.GetType().Name}: {ex.Message}");
+        }
+
+        try { File.WriteAllLines(resultPath, lines); } catch { }
     }
 
     /// <summary>

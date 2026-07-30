@@ -17,6 +17,7 @@ public sealed class TrayApplicationContext : ApplicationContext
 {
     private readonly NotifyIcon _tray;
     private readonly ToolStripMenuItem _statusItem;
+    private readonly ToolStripMenuItem _testMenu = new("&Test print");
     private readonly ActivityLog _log;
     private readonly Control _marshal;
     private readonly PrintServer _server;
@@ -29,18 +30,23 @@ public sealed class TrayApplicationContext : ApplicationContext
         _settings = JsonSettingsStore.Load();
         _log = new ActivityLog(JsonSettingsStore.FolderPath);
 
-        // A print server with no key can't serve, and making the operator press
-        // a button to get one adds nothing — generate it on first run.
-        if (string.IsNullOrWhiteSpace(_settings.ApiKey))
-        {
-            _settings.ApiKey = AppSettings.NewApiKey();
-            JsonSettingsStore.Save(_settings);
-        }
-
         // State arrives on Kestrel's threads; this gives us a handle on the UI
         // thread to marshal through.
-        _marshal = new Control();
-        _marshal.CreateControl();
+        //
+        // A Form whose Handle we touch but never Show, rather than a bare
+        // Control: CreateControl() on a parentless Control produces a genuine
+        // top-level window that the shell will happily paint as a blank grey
+        // rectangle on the desktop. Touching Handle creates the window without
+        // ever setting WS_VISIBLE.
+        _marshal = new Form
+        {
+            FormBorderStyle = FormBorderStyle.None,
+            ShowInTaskbar = false,
+            StartPosition = FormStartPosition.Manual,
+            Location = new Point(-32000, -32000),
+            Size = new Size(1, 1)
+        };
+        _ = _marshal.Handle;
 
         _statusItem = new ToolStripMenuItem("Starting…") { Enabled = false };
 
@@ -58,10 +64,12 @@ public sealed class TrayApplicationContext : ApplicationContext
         menu.Items.Add("&Settings…", null, (_, _) => ShowSettings());
         menu.Items.Add("&Activity…", null, (_, _) => ShowActivity());
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("Test &receipt print", null, (_, _) => TestPrint(PrintTargets.Receipt));
-        menu.Items.Add("Test &label print", null, (_, _) => TestPrint(PrintTargets.Label));
+        menu.Items.Add(_testMenu);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Re&start server", null, async (_, _) => await _server.RestartAsync());
+        menu.Items.Add(new ToolStripSeparator());
+        // Fully qualified: an unqualified "Help" binds to System.Windows.Forms.Help.
+        menu.Items.Add("&Help", null, (_, _) => MaplePrint.Help.HelpDocument.Show());
         menu.Items.Add("E&xit", null, (_, _) => ExitThread());
 
         _tray = new NotifyIcon
@@ -75,11 +83,12 @@ public sealed class TrayApplicationContext : ApplicationContext
 
         _log.Info($"MaplePrint {PrintServer.Version} started.");
 
+        RebuildTestMenu();
         _ = _server.StartAsync();
 
         // No printers mapped means every job will be refused, so nudge on first
         // run — but after the server is up, not instead of it.
-        if (string.IsNullOrWhiteSpace(_settings.ReceiptQueue) && string.IsNullOrWhiteSpace(_settings.LabelQueue))
+        if (_settings.Destinations.TrueForAll(d => !d.IsConfigured))
             BeginInvokeOnUi(ShowSettings);
     }
 
@@ -126,8 +135,10 @@ public sealed class TrayApplicationContext : ApplicationContext
     {
         if (string.IsNullOrWhiteSpace(_settings.ApiKey))
         {
-            MessageBox.Show("No API key yet — open Settings.", "MaplePrint",
-                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show(
+                "No API key is set, so callers don't need one. Set a key in Settings if you "
+                + "need to restrict who can print.",
+                "MaplePrint", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
@@ -150,11 +161,19 @@ public sealed class TrayApplicationContext : ApplicationContext
     private void ShowSettings()
     {
         using var form = new SettingsForm(_settings);
-        if (form.ShowDialog() != DialogResult.OK) return;
+        var committed = form.ShowDialog() == DialogResult.OK;
 
-        _settings = form.Result;
+        if (committed) _settings = form.Result;
+
+        // Written either way. The dialog records its size and position as it
+        // closes, and cancelling an edit shouldn't throw that away — the window
+        // geometry isn't one of the settings being edited.
         JsonSettingsStore.Save(_settings);
+
+        if (!committed) return;
+
         StartupRegistration.Apply(_settings.StartWithWindows);
+        RebuildTestMenu();
         _log.Info("Settings saved.");
 
         _server.UpdateSettings(_settings);
@@ -175,38 +194,85 @@ public sealed class TrayApplicationContext : ApplicationContext
     }
 
     /// <summary>
+    /// Built from the configured destinations rather than hard-coded, because
+    /// there is no longer a fixed pair of them — a shop can add a third printer
+    /// in Settings and must be able to test it from here without a new build.
+    /// </summary>
+    private void RebuildTestMenu()
+    {
+        _testMenu.DropDownItems.Clear();
+
+        var ready = _settings.Destinations.Where(d => d.IsConfigured).ToList();
+        if (ready.Count == 0)
+        {
+            _testMenu.DropDownItems.Add(new ToolStripMenuItem("No printers set up yet") { Enabled = false });
+            return;
+        }
+
+        foreach (var destination in ready)
+        {
+            // Captured per iteration; the handler must not close over the loop
+            // variable's final value.
+            var name = destination.Name;
+            _testMenu.DropDownItems.Add($"{name}  ({Shorten(destination.Queue)})", null, (_, _) => TestPrint(name));
+        }
+    }
+
+    private static string Shorten(string value) =>
+        value.Length <= 34 ? value : value[..31] + "…";
+
+    /// <summary>
     /// Prints without going through the API — this is the first thing to try
     /// when a shop reports "nothing prints", because it splits the problem
     /// cleanly into paper-path versus caller.
     /// </summary>
-    private void TestPrint(string target)
+    private void TestPrint(string destinationName)
     {
-        var queue = target == PrintTargets.Receipt ? _settings.ReceiptQueue : _settings.LabelQueue;
-        var what = target == PrintTargets.Receipt ? "receipt" : "label";
+        var destination = _settings.Find(destinationName);
 
-        if (string.IsNullOrWhiteSpace(queue))
+        if (destination is null || !destination.IsConfigured)
         {
-            MessageBox.Show($"No {what} printer is set yet. Choose one in Settings first.",
+            MessageBox.Show($"No printer is set for '{destinationName}' yet. Choose one in Settings first.",
                 "MaplePrint", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
-        var payload = target == PrintTargets.Receipt
-            ? TestDocuments.Receipt(_settings.StationName)
-            : TestDocuments.Label(_settings.StationName);
+        var documentName = $"MaplePrint {destination.Name} test";
+        var error = destination.Kind == DestinationKind.Document
+            ? PrintTestImage(destination, documentName)
+            : RawPrinter.Send(destination.Queue, TestBytesFor(destination), documentName);
 
-        var error = RawPrinter.Send(queue, payload, $"MaplePrint {what} test");
         if (error is null)
         {
-            _log.Success($"Test {what} sent to {queue}.");
-            _tray.ShowBalloonTip(3000, "MaplePrint", $"Test {what} sent to {queue}.", ToolTipIcon.Info);
+            _log.Success($"Test {destination.Name} sent to {destination.Queue}.");
+            _tray.ShowBalloonTip(3000, "MaplePrint", $"Test {destination.Name} sent to {destination.Queue}.", ToolTipIcon.Info);
         }
         else
         {
-            _log.Error($"Test {what} failed: {error}");
+            _log.Error($"Test {destination.Name} failed: {error}");
             MessageBox.Show(error, "MaplePrint", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
     }
+
+    private string? PrintTestImage(Destination destination, string documentName)
+    {
+        using var image = TestDocuments.CalibrationImage(_settings.StationName, destination.DotWidth, destination.RenderDpi);
+        return DocumentPrinter.Print(
+            destination.Queue, image, documentName,
+            paperSizeName: destination.PaperSizeName,
+            renderDpi: destination.RenderDpi,
+            note: _log.Info);
+    }
+
+    /// <summary>
+    /// Chosen by the destination's declared language rather than its name, so a
+    /// second ZPL printer called anything at all still gets a ZPL self-test.
+    /// </summary>
+    private byte[] TestBytesFor(Destination destination) => destination.Language switch
+    {
+        PrinterLanguages.Zpl => TestDocuments.Label(_settings.StationName),
+        _ => TestDocuments.Receipt(_settings.StationName)
+    };
 
     /// <summary>
     /// Pulls the maple leaf out of our own executable's Win32 resources, which

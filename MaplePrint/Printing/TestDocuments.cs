@@ -1,3 +1,6 @@
+using System.Drawing.Drawing2D;
+using System.Drawing.Text;
+using System.Runtime.Versioning;
 using System.Text;
 
 namespace MaplePrint.Printing;
@@ -77,4 +80,112 @@ public static class TestDocuments
     /// </summary>
     private static string Sanitize(string value) =>
         new(value.Where(c => c is not ('^' or '~') && !char.IsControl(c)).ToArray());
+
+    /// <summary>
+    /// A calibration slip for a <c>document</c> destination — the path a raster
+    /// receipt printer like the Star TSP143 actually uses.
+    ///
+    /// Deliberately measurable rather than decorative. The rules run the full
+    /// bitmap width, so if they don't reach both paper edges the render width is
+    /// wrong; and the scale bar is exactly one inch of dots, so a ruler against
+    /// the paper settles whether one bitmap pixel became one printer dot. Those
+    /// two checks are the only way to know the drawing maths is right without
+    /// reading the driver's mind.
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    public static Bitmap CalibrationImage(string stationName, int dotWidth = DefaultReceiptDots, int dpi = DefaultDpi)
+    {
+        if (dotWidth <= 0) dotWidth = DefaultReceiptDots;
+        if (dpi <= 0) dpi = DefaultDpi;
+
+        const int margin = 12;
+
+        // Sized to the content: this prints on a roll, and every unused dot of
+        // height is paper the shop throws away on each diagnostic.
+        const int height = 300;
+
+        var bmp = new Bitmap(dotWidth, height);
+        bmp.SetResolution(dpi, dpi);
+
+        using var g = Graphics.FromImage(bmp);
+        g.Clear(Color.White);
+        g.SmoothingMode = SmoothingMode.None;
+        g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+
+        using var black = new SolidBrush(Color.Black);
+        using var pen = new Pen(Color.Black, 2);
+        using var title = new Font("Segoe UI", 30, FontStyle.Bold, GraphicsUnit.Pixel);
+        using var body = new Font("Segoe UI", 19, FontStyle.Regular, GraphicsUnit.Pixel);
+        using var small = new Font("Segoe UI", 16, FontStyle.Regular, GraphicsUnit.Pixel);
+
+        // Edge-to-edge rules: these must touch both sides of the paper.
+        g.FillRectangle(black, 0, 0, dotWidth, 3);
+        g.FillRectangle(black, 0, height - 3, dotWidth, 3);
+
+        var y = 18f;
+        g.DrawString("MaplePrint", title, black, margin, y);
+        y += 40;
+        g.DrawString("Print calibration", body, black, margin, y);
+        y += 28;
+        g.DrawString(stationName, small, black, margin, y);
+        y += 24;
+        g.DrawString(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"), small, black, margin, y);
+        y += 32;
+
+        g.FillRectangle(black, margin, y, dotWidth - margin * 2, 1);
+        y += 18;
+
+        // One inch of dots, with end ticks to measure between.
+        var barLeft = (float)margin;
+        var barRight = margin + dpi;
+        g.DrawLine(pen, barLeft, y + 12, barRight, y + 12);
+        g.DrawLine(pen, barLeft, y + 4, barLeft, y + 20);
+        g.DrawLine(pen, barRight, y + 4, barRight, y + 20);
+        g.DrawString($"= 1 inch ({dpi} dots)", small, black, barRight + 10, y + 2);
+        y += 34;
+
+        g.DrawString($"Rendered {dotWidth} dots wide at {dpi} dpi.", small, black, margin, y);
+        y += 22;
+        g.DrawString("Rules above and below should touch both edges.", small, black, margin, y);
+        y += 24;
+
+        // Fine-detail patches. Anything that resamples the bitmap — a scale, a
+        // driver dither, a caller rendering at the wrong width — turns the
+        // 1-dot checker into uneven grey mush instead of a sharp pattern. This
+        // is the check that predicts whether a QR code will scan, because a QR
+        // is exactly this: small hard-edged squares that must survive intact.
+        Checker(g, black, margin, (int)y, 48, 26, 1);
+        Checker(g, black, margin + 60, (int)y, 48, 26, 4);
+        g.DrawString("1-dot / 4-dot: must stay sharp", small, black, margin + 118, y + 4);
+
+        return bmp;
+    }
+
+    /// <summary>
+    /// A checkerboard of <paramref name="cell"/>-dot squares. Bitmap coordinates
+    /// are dots here, and smoothing is off, so each square lands on exact dot
+    /// boundaries — which is the point: any softness on paper came from the
+    /// print path, not from this.
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    private static void Checker(Graphics g, Brush brush, int left, int top, int width, int height, int cell)
+    {
+        for (var x = 0; x < width; x += cell)
+        {
+            for (var y = 0; y < height; y += cell)
+            {
+                if ((x / cell + y / cell) % 2 != 0) continue;
+
+                var w = Math.Min(cell, width - x);
+                var h = Math.Min(cell, height - y);
+                g.FillRectangle(brush, left + x, top + y, w, h);
+            }
+        }
+    }
+
+    /// <summary>80 mm roll, 72 mm printable, at 203 dpi.</summary>
+    public const int DefaultReceiptDots = 576;
+
+    /// <summary>The thermal standard, and what both the Star and the Zebra run at.</summary>
+    public const int DefaultDpi = 203;
 }
