@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationIcon>Images\maple.ico</ApplicationIcon>
+    <RootNamespace>MaplePrint</RootNamespace>
+    <AssemblyName>MaplePrint</AssemblyName>
+    <Version>1.0.0</Version>
+    <Product>MaplePrint</Product>
+    <Description>Local print server — accepts print jobs over HTTP and spools them to this PC's printers</Description>
+    <Company>SPC</Company>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Kestrel, for the local HTTP API. Deliberately Kestrel rather than
+         System.Net.HttpListener: HttpListener needs a `netsh http add urlacl`
+         (i.e. an administrator) before it may bind anything but localhost,
+         which would make "let the POS on the next desk reach it" an IT ticket.
+         Kestrel binds the socket directly and needs no such thing. -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <!-- The tray icon is read back out of our own .exe at runtime (see
+       TrayApplicationContext.LoadIcon), so ApplicationIcon above is the only
+       place it needs to be declared. Shipping it as a loose file would defeat
+       the single-file publish. -->
+
+</Project>
