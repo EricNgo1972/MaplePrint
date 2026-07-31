@@ -41,19 +41,25 @@ public sealed class ActivityForm : Form
             HorizontalScrollbar = true
         };
 
+        // Measured, not sized in pixels. Five buttons of hand-picked widths fit
+        // at one font scale and clip at the next — which is what a button
+        // reading "See a" instead of "See a label…" was.
         var bottom = new FlowLayoutPanel
         {
             Dock = DockStyle.Bottom,
             FlowDirection = FlowDirection.RightToLeft,
-            Height = 44,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            WrapContents = false,
             Padding = new Padding(8)
         };
 
-        var close = new Button { Text = "Close", Width = 90, DialogResult = DialogResult.Cancel };
-        var openFile = new Button { Text = "Open log file", Width = 110 };
-        var copy = new Button { Text = "Copy all", Width = 90 };
-        var seeLabel = new Button { Text = "See a label…", Width = 110 };
-        var savedJobs = new Button { Text = "Saved jobs", Width = 100 };
+        var close = Footer("Close");
+        close.DialogResult = DialogResult.Cancel;
+        var openFile = Footer("Open log file");
+        var copy = Footer("Copy all");
+        var seeLabel = Footer("See a label…");
+        var savedJobs = Footer("Saved jobs");
 
         close.Click += (_, _) => Close();
         copy.Click += (_, _) => CopyAll();
@@ -74,12 +80,30 @@ public sealed class ActivityForm : Form
         Controls.Add(bottom);
         CancelButton = close;
 
+        // The window may not be allowed to get narrower than its own buttons.
+        // Measured for the same reason they are: five of them at a large font
+        // scale need more room than any number typed here would have guessed.
+        var needed = bottom.PreferredSize.Width + (Width - ClientSize.Width) + 16;
+        MinimumSize = new Size(Math.Max(MinimumSize.Width, needed), MinimumSize.Height);
+
         foreach (var entry in _log.Snapshot()) _list.Items.Add(entry.ToString());
         ScrollToEnd();
 
         _log.Appended += OnAppended;
         FormClosed += (_, _) => _log.Appended -= OnAppended;
     }
+
+    /// <summary>A footer button that is as wide as its own text, with a minimum
+    /// so short labels don't come out cramped beside long ones.</summary>
+    private static Button Footer(string text) => new()
+    {
+        Text = text,
+        AutoSize = true,
+        AutoSizeMode = AutoSizeMode.GrowAndShrink,
+        MinimumSize = new Size(84, 0),
+        Padding = new Padding(10, 4, 10, 4),
+        Margin = new Padding(4, 3, 4, 3)
+    };
 
     private void OnAppended(ActivityEntry entry)
     {
