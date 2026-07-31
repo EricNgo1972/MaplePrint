@@ -52,6 +52,27 @@ public static class JobArchive
     }
 
     /// <summary>
+    /// The most recently saved labels, newest first. Only ZPL: those are the
+    /// ones that can be turned back into a picture, and a list mixing in files
+    /// that can't be previewed would just be a list of disappointments.
+    /// </summary>
+    public static IReadOnlyList<FileInfo> RecentLabels(int count)
+    {
+        try
+        {
+            return new DirectoryInfo(Folder)
+                .GetFiles("*.zpl")
+                .OrderByDescending(f => f.LastWriteTimeUtc)
+                .Take(count)
+                .ToList();
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
+    /// <summary>
     /// The extension that makes the file open in something useful: the printer's
     /// language for raw jobs, and the image format for rendered ones.
     /// </summary>
