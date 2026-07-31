@@ -42,7 +42,14 @@ public static class LabelPreview
             CultureInfo.InvariantCulture,
             $"http://api.labelary.com/v1/printers/{Dpmm(dpi)}dpmm/labels/{width:0.##}x{height:0.##}/0/");
 
-        using var response = await Http.PostAsync(url, new StringContent(zpl), ct);
+        // Content type set by hand: StringContent defaults to
+        // "text/plain; charset=utf-8", and the charset is enough for the viewer
+        // to refuse the whole request with a 415.
+        using var body = new StringContent(zpl);
+        body.Headers.ContentType =
+            new System.Net.Http.Headers.MediaTypeHeaderValue("application/x-www-form-urlencoded");
+
+        using var response = await Http.PostAsync(url, body, ct);
         if (!response.IsSuccessStatusCode)
         {
             var detail = await response.Content.ReadAsStringAsync(ct);
