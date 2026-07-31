@@ -55,6 +55,10 @@ public sealed class SettingsForm : Form
     private int _row;
     private int _gridRow = -1;
 
+    /// <summary>True while rows are being filled in, so the paper-picked-a-width
+    /// handler doesn't fire against half-populated rows.</summary>
+    private bool _populating;
+
     public SettingsForm(AppSettings current)
     {
         Result = current;
@@ -202,18 +206,70 @@ public sealed class SettingsForm : Form
         };
         kind.Items.AddRange(KindDocument, KindRaw);
 
-        var dots = new DataGridViewTextBoxColumn { HeaderText = "Dots", Width = 58, ToolTipText = "Printable width in dots, advertised to callers" };
+        // What is loaded, in the words on the box. Picking one fills in Dots
+        // below, which stays the stored truth — nobody knows their printer's
+        // printable width in dots, and everybody knows whether they put an 80 mm
+        // roll or a 2 inch label in it.
+        var width = new DataGridViewComboBoxColumn
+        {
+            HeaderText = "Paper",
+            Width = 116,
+            FlatStyle = FlatStyle.Flat,
+            DisplayStyle = DataGridViewComboBoxDisplayStyle.ComboBox,
+            ToolTipText = "The roll that is loaded. Sets Dots for you."
+        };
+        width.Items.AddRange([.. PaperWidths.All.Select(p => p.Name)]);
+        width.Items.Add(PaperWidths.Custom);
+
+        var dots = new DataGridViewTextBoxColumn { HeaderText = "Dots", Width = 58, ToolTipText = "Printable width in dots, advertised to callers. Set by Paper, or type it for an odd printer." };
         var dpi = new DataGridViewTextBoxColumn { HeaderText = "DPI", Width = 48, ToolTipText = "Resolution the caller's artwork is drawn at" };
         var paper = new DataGridViewTextBoxColumn { HeaderText = "Paper form", Width = 118, ToolTipText = "Blank = the driver's own setting. Or a form name, or \"auto\"." };
 
-        _grid.Columns.AddRange(enabled, name, queue, kind, dots, dpi, paper);
+        _grid.Columns.AddRange(enabled, name, queue, kind, width, dots, dpi, paper);
 
+        _populating = true;
         foreach (var d in current.Destinations) AddRow(d);
+        _populating = false;
+
+        // Picking a roll writes the dots it implies. Committed immediately so the
+        // number is visible while the combo still has focus — a value that only
+        // appeared after clicking away would read as not having taken.
+        _grid.CurrentCellDirtyStateChanged += (_, _) =>
+        {
+            if (_grid.IsCurrentCellDirty && _grid.CurrentCell?.ColumnIndex == ColPaperWidth)
+                _grid.CommitEdit(DataGridViewDataErrorContexts.Commit);
+        };
+
+        _grid.CellValueChanged += (_, e) =>
+        {
+            // Rows.Add fills cells left to right, so this fires while Dots and
+            // DPI further right are still empty — and would compute from a
+            // missing resolution before the real width lands.
+            if (_populating || e.RowIndex < 0 || e.ColumnIndex != ColPaperWidth) return;
+
+            var row = _grid.Rows[e.RowIndex];
+            TryPositive(CellText(row, ColDpi), out var rowDpi, allowBlank: true);
+
+            // Custom means "leave it alone" — it is what an already-typed width
+            // shows as, and choosing it must not wipe that width out.
+            if (PaperWidths.DotsFor(CellText(row, ColPaperWidth), rowDpi) is { } computed)
+                row.Cells[ColDots].Value = computed.ToString();
+        };
 
         // A queue or kind that isn't in the list would otherwise raise a modal
         // DataError at the user; there is nothing they could do about it.
         _grid.DataError += (_, e) => e.ThrowException = false;
     }
+
+    // Column positions, named so the read-back below doesn't drift from the
+    // order the columns were added in.
+    private const int ColName = 1;
+    private const int ColQueue = 2;
+    private const int ColKind = 3;
+    private const int ColPaperWidth = 4;
+    private const int ColDots = 5;
+    private const int ColDpi = 6;
+    private const int ColPaperForm = 7;
 
     private void AddRow(Destination d) =>
         _grid.Rows.Add(
@@ -221,6 +277,9 @@ public sealed class SettingsForm : Form
             d.Name,
             string.IsNullOrWhiteSpace(d.Queue) ? NoPrinter : d.Queue,
             d.Kind == DestinationKind.Raw ? KindRaw : KindDocument,
+            // Shown as the paper it corresponds to, so an existing destination
+            // reads as "2.2″ label" rather than as 448.
+            PaperWidths.NameFor(d.DotWidth, d.RenderDpi),
             d.DotWidth > 0 ? d.DotWidth.ToString() : "",
             d.RenderDpi > 0 ? d.RenderDpi.ToString() : Destination.DefaultRenderDpi.ToString(),
             d.PaperSizeName ?? "");
@@ -476,7 +535,7 @@ public sealed class SettingsForm : Form
         {
             if (row.IsNewRow) continue;
 
-            var name = CellText(row, 1).Trim();
+            var name = CellText(row, ColName).Trim();
             if (string.IsNullOrWhiteSpace(name))
             {
                 problem = "Every destination needs a name — that is what callers address.";
@@ -489,23 +548,23 @@ public sealed class SettingsForm : Form
                 return false;
             }
 
-            if (!TryPositive(CellText(row, 4), out var dots, allowBlank: true))
+            if (!TryPositive(CellText(row, ColDots), out var dots, allowBlank: true))
             {
                 problem = $"'{name}': Dots must be a whole number of printer dots, or blank.";
                 return false;
             }
 
-            if (!TryPositive(CellText(row, 5), out var dpi, allowBlank: true))
+            if (!TryPositive(CellText(row, ColDpi), out var dpi, allowBlank: true))
             {
                 problem = $"'{name}': DPI must be a whole number, or blank.";
                 return false;
             }
 
-            var kind = string.Equals(CellText(row, 3), KindRaw, StringComparison.OrdinalIgnoreCase)
+            var kind = string.Equals(CellText(row, ColKind), KindRaw, StringComparison.OrdinalIgnoreCase)
                 ? DestinationKind.Raw
                 : DestinationKind.Document;
 
-            var queue = CellText(row, 2).Trim();
+            var queue = CellText(row, ColQueue).Trim();
             if (string.Equals(queue, NoPrinter, StringComparison.OrdinalIgnoreCase)) queue = "";
 
             // Language isn't in the grid — it only feeds error messages — so
@@ -520,7 +579,7 @@ public sealed class SettingsForm : Form
                 Language = existing?.Language,
                 DotWidth = dots,
                 RenderDpi = dpi > 0 ? dpi : Destination.DefaultRenderDpi,
-                PaperSizeName = Blank(CellText(row, 6)),
+                PaperSizeName = Blank(CellText(row, ColPaperForm)),
                 Enabled = row.Cells[0].Value is true
             });
         }

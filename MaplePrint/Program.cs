@@ -52,9 +52,24 @@ internal static class Program
         }
 
         ApplicationConfiguration.Initialize();
-        Application.Run(new TrayApplicationContext());
+
+        // Disposed explicitly. Application.Run does not dispose the context it is
+        // handed, so without this Exit ended the message loop and left the HTTP
+        // server listening — the tray icon vanished while the process stayed in
+        // Task Manager, still answering print jobs.
+        using (var context = new TrayApplicationContext())
+        {
+            Application.Run(context);
+        }
 
         GC.KeepAlive(mutex);
+
+        // Belt and braces. Everything of ours is shut down by here, but Kestrel
+        // and the printing stack both bring their own threads, and one of them
+        // outliving Main is exactly what "Exit doesn't close it" looked like to
+        // the shop. Exit must mean exit on a counter PC — there is nobody there
+        // to open Task Manager.
+        Environment.Exit(0);
     }
 
     private static void RunRenderTest(string outputPath, int dotWidth)

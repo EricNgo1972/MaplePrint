@@ -120,3 +120,65 @@ public static class DotWidths
     /// <summary>2.20″ printable at 203 dpi — Zebra LP 2824 and friends.</summary>
     public const int Label2Inch = 448;
 }
+
+/// <summary>One roll of paper, named the way the box it came in is.</summary>
+public sealed record PaperWidth(string Name, int DotsAt203Dpi);
+
+/// <summary>
+/// The paper an operator can actually identify, so that setting a destination up
+/// is answering "what is loaded?" rather than "how many dots across is the
+/// printable area?".
+///
+/// <para>Dots remain the stored truth — they are what callers are told and what
+/// decides the artwork's physical size (<c>pixels ÷ RenderDpi</c>). This is a
+/// shortcut that fills them in, not a replacement: an odd printer can still have
+/// its width typed straight in.</para>
+///
+/// <para>Held at 203 dpi, the resolution of nearly every thermal printer, and
+/// scaled for the rest. Receipt figures are the industry ones (576 / 384) rather
+/// than derived, because those are what the drivers and every other POS assume;
+/// labels are simply their width times the resolution.</para>
+/// </summary>
+public static class PaperWidths
+{
+    /// <summary>Shown when the width matches no known roll. Selecting it changes
+    /// nothing — it means "leave the dots alone".</summary>
+    public const string Custom = "Custom…";
+
+    public static readonly PaperWidth[] All =
+    [
+        new("80 mm receipt", DotWidths.Receipt80mm),
+        new("58 mm receipt", 384),
+        new("2″ label", 406),
+        new("2.2″ label", DotWidths.Label2Inch),
+        new("3″ label", 609),
+        new("4″ label", 812),
+    ];
+
+    private static int Scale(int dotsAt203, int dpi) =>
+        dpi is <= 0 or Destination.DefaultRenderDpi
+            ? dotsAt203
+            : (int)Math.Round(dotsAt203 * (dpi / (double)Destination.DefaultRenderDpi));
+
+    /// <summary>Dots for a named roll at this resolution, or null for
+    /// <see cref="Custom"/> and anything unrecognised.</summary>
+    public static int? DotsFor(string? name, int dpi)
+    {
+        var paper = All.FirstOrDefault(
+            p => string.Equals(p.Name, name, StringComparison.OrdinalIgnoreCase));
+        return paper is null ? null : Scale(paper.DotsAt203Dpi, dpi);
+    }
+
+    /// <summary>The roll a width corresponds to, for showing an existing
+    /// destination as the paper it is rather than as a number.</summary>
+    public static string NameFor(int dots, int dpi)
+    {
+        if (dots <= 0) return Custom;
+
+        foreach (var paper in All)
+            if (Scale(paper.DotsAt203Dpi, dpi) == dots)
+                return paper.Name;
+
+        return Custom;
+    }
+}
