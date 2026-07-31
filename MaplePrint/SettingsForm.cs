@@ -20,7 +20,12 @@ public sealed class SettingsForm : Form
     private const int FooterHeight = 56;
 
     private const string KindDocument = "Document";
-    private const string KindRaw = "Raw";
+
+    // Raw is split by command language because that is the choice being made:
+    // "Raw" alone left Language unset, and a caller reading a raw destination
+    // with no language sends ESC/POS — which a Zebra prints as pages of noise.
+    private const string KindRawZpl = "Raw — ZPL (Zebra)";
+    private const string KindRawEscPos = "Raw — ESC/POS";
 
     /// <summary>
     /// Stands in for "no printer assigned" in the Printer column. An empty
@@ -199,12 +204,12 @@ public sealed class SettingsForm : Form
             HeaderText = "Kind",
             // Wide enough for "Document" plus the dropdown arrow; narrower and
             // it renders as "Docum...", which reads as a bug rather than a value.
-            Width = 142,
+            Width = 168,
             FlatStyle = FlatStyle.Flat,
             DisplayStyle = DataGridViewComboBoxDisplayStyle.ComboBox,
-            ToolTipText = "Document = send a rendered page. Raw = send device bytes (ZPL, ESC/POS)."
+            ToolTipText = "Document = a rendered page, works on any printer. Raw = device bytes, straight to the printer's own language."
         };
-        kind.Items.AddRange(KindDocument, KindRaw);
+        kind.Items.AddRange(KindDocument, KindRawZpl, KindRawEscPos);
 
         // What is loaded, in the words on the box. Picking one fills in Dots
         // below, which stays the stored truth — nobody knows their printer's
@@ -276,7 +281,7 @@ public sealed class SettingsForm : Form
             d.Enabled,
             d.Name,
             string.IsNullOrWhiteSpace(d.Queue) ? NoPrinter : d.Queue,
-            d.Kind == DestinationKind.Raw ? KindRaw : KindDocument,
+            KindLabel(d),
             // Shown as the paper it corresponds to, so an existing destination
             // reads as "2.2″ label" rather than as 448.
             PaperWidths.NameFor(d.DotWidth, d.RenderDpi),
@@ -310,9 +315,53 @@ public sealed class SettingsForm : Form
             if (_grid.CurrentRow is { } row && !row.IsNewRow) _grid.Rows.Remove(row);
         };
 
+        // Dots, DPI and the driver's form are how a printer is described once, by
+        // whoever installs it. Setting a shop up is answering "which printer, and
+        // what is in it?" — so the rest stays out of the way until someone on a
+        // support call needs it.
+        var advanced = new CheckBox
+        {
+            Text = "Advanced",
+            AutoSize = true,
+            Margin = new Padding(16, 4, 0, 0),
+            Checked = ShouldStartAdvanced()
+        };
+        advanced.CheckedChanged += (_, _) => ShowAdvancedColumns(advanced.Checked);
+
         host.Controls.Add(add);
         host.Controls.Add(remove);
+        host.Controls.Add(advanced);
+
+        ShowAdvancedColumns(advanced.Checked);
         return host;
+    }
+
+    private void ShowAdvancedColumns(bool visible)
+    {
+        foreach (var column in new[] { ColDots, ColDpi, ColPaperForm })
+            if (column < _grid.Columns.Count) _grid.Columns[column].Visible = visible;
+    }
+
+    /// <summary>
+    /// Opens showing the detail when a destination holds something this dialog
+    /// can't express any other way — an unrecognised width, or a driver form.
+    /// Hiding a value that is in force, and that the operator would then have no
+    /// way to see, is worse than one extra column.
+    /// </summary>
+    private bool ShouldStartAdvanced()
+    {
+        foreach (DataGridViewRow row in _grid.Rows)
+        {
+            if (row.IsNewRow) continue;
+
+            if (!string.IsNullOrWhiteSpace(CellText(row, ColPaperForm))) return true;
+
+            if (string.Equals(CellText(row, ColPaperWidth), PaperWidths.Custom, StringComparison.Ordinal) &&
+                !string.IsNullOrWhiteSpace(CellText(row, ColDots)))
+                return true;
+        }
+
+        return false;
     }
 
     // ---- Layout ----------------------------------------------------------
@@ -326,8 +375,11 @@ public sealed class SettingsForm : Form
         Hint("Off: only this PC can send jobs. On: Windows Firewall may need to allow the port.");
 
         Section("Destinations");
-        Hint("Names callers address, and what each one maps to here. Document = send a rendered "
-           + "page; Raw = send device bytes such as ZPL.");
+        Hint("Names callers address, and what each one maps to here. Document prints a rendered "
+           + "page through the Windows driver — it works on any printer and handles logos and "
+           + "accents. Raw sends the printer its own language instead, which is usually the "
+           + "better fit for a label printer: it takes the label's size from the printer rather "
+           + "than the driver. Pick Paper to match what is loaded.");
         _gridRow = _row;
         AddSpanning(_grid, grow: true);
         AddSpanning(GridButtons());
@@ -560,23 +612,17 @@ public sealed class SettingsForm : Form
                 return false;
             }
 
-            var kind = string.Equals(CellText(row, ColKind), KindRaw, StringComparison.OrdinalIgnoreCase)
-                ? DestinationKind.Raw
-                : DestinationKind.Document;
+            var (kind, language) = KindFromLabel(CellText(row, ColKind));
 
             var queue = CellText(row, ColQueue).Trim();
             if (string.Equals(queue, NoPrinter, StringComparison.OrdinalIgnoreCase)) queue = "";
-
-            // Language isn't in the grid — it only feeds error messages — so
-            // carry it from the existing entry rather than dropping it.
-            var existing = _original.Find(name);
 
             destinations.Add(new Destination
             {
                 Name = name,
                 Queue = queue,
                 Kind = kind,
-                Language = existing?.Language,
+                Language = language,
                 DotWidth = dots,
                 RenderDpi = dpi > 0 ? dpi : Destination.DefaultRenderDpi,
                 PaperSizeName = Blank(CellText(row, ColPaperForm)),
@@ -585,6 +631,28 @@ public sealed class SettingsForm : Form
         }
 
         return true;
+    }
+
+    /// <summary>How a stored destination reads in the Kind column.</summary>
+    private static string KindLabel(Destination d) =>
+        d.Kind != DestinationKind.Raw
+            ? KindDocument
+            : string.Equals(d.Language, PrinterLanguages.Zpl, StringComparison.OrdinalIgnoreCase)
+                ? KindRawZpl
+                : KindRawEscPos;
+
+    /// <summary>The Kind column back into what a destination stores. ESC/POS is
+    /// the fallback for any raw entry, which is what a blank language already
+    /// meant to every caller.</summary>
+    private static (DestinationKind Kind, string? Language) KindFromLabel(string label)
+    {
+        if (string.Equals(label, KindRawZpl, StringComparison.OrdinalIgnoreCase))
+            return (DestinationKind.Raw, PrinterLanguages.Zpl);
+
+        if (string.Equals(label, KindRawEscPos, StringComparison.OrdinalIgnoreCase))
+            return (DestinationKind.Raw, PrinterLanguages.EscPos);
+
+        return (DestinationKind.Document, null);
     }
 
     private static string CellText(DataGridViewRow row, int column) =>
