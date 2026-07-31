@@ -18,7 +18,6 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly NotifyIcon _tray;
     private readonly ToolStripMenuItem _statusItem;
     private readonly ToolStripMenuItem _testMenu = new("&Test print");
-    private readonly ToolStripMenuItem _labelMenu = new("&See a label");
     private readonly ActivityLog _log;
     private readonly Control _marshal;
     private readonly PrintServer _server;
@@ -64,8 +63,6 @@ public sealed class TrayApplicationContext : ApplicationContext
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("&Settings…", null, (_, _) => ShowSettings());
         menu.Items.Add("&Activity…", null, (_, _) => ShowActivity());
-        menu.Items.Add(_labelMenu);
-        menu.Items.Add("Saved &jobs…", null, (_, _) => ShowSavedJobs());
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(_testMenu);
         menu.Items.Add(new ToolStripSeparator());
@@ -83,10 +80,6 @@ public sealed class TrayApplicationContext : ApplicationContext
             ContextMenuStrip = menu
         };
         _tray.DoubleClick += (_, _) => ShowActivity();
-
-        // Rebuilt as the menu opens: the label worth looking at is usually the
-        // one that came out of the printer thirty seconds ago.
-        _labelMenu.DropDownOpening += (_, _) => RebuildLabelMenu();
 
         _log.Info($"MaplePrint {PrintServer.Version} started.");
 
@@ -195,7 +188,7 @@ public sealed class TrayApplicationContext : ApplicationContext
             return;
         }
 
-        _activityForm = new ActivityForm(_log);
+        _activityForm = new ActivityForm(_log, _settings);
         _activityForm.FormClosed += (_, _) => _activityForm = null;
         _activityForm.Show();
     }
@@ -227,75 +220,6 @@ public sealed class TrayApplicationContext : ApplicationContext
 
     private static string Shorten(string value) =>
         value.Length <= 34 ? value : value[..31] + "…";
-
-    /// <summary>
-    /// The last few labels, so one can be looked at. Rebuilt on open rather than
-    /// cached: the whole point is to see the job that just came out wrong.
-    /// </summary>
-    private void RebuildLabelMenu()
-    {
-        _labelMenu.DropDownItems.Clear();
-
-        var recent = JobArchive.RecentLabels(5);
-        if (recent.Count == 0)
-        {
-            var why = _settings.SaveJobCopies
-                ? "No labels printed yet"
-                : "Turn on saving jobs in Settings first";
-            _labelMenu.DropDownItems.Add(new ToolStripMenuItem(why) { Enabled = false });
-            return;
-        }
-
-        foreach (var file in recent)
-        {
-            // Captured per iteration; the handler must not close over the loop
-            // variable's final value.
-            var path = file.FullName;
-            var caption = $"{file.LastWriteTime:HH:mm:ss}  {DestinationOf(file.Name)}";
-            _labelMenu.DropDownItems.Add(caption, null, async (_, _) => await ShowLabelAsync(path));
-        }
-    }
-
-    /// <summary>The destination out of a saved job's file name, which is stamped
-    /// "20260731-144512-345-label.zpl".</summary>
-    private static string DestinationOf(string fileName)
-    {
-        var stem = Path.GetFileNameWithoutExtension(fileName);
-        var dash = stem.LastIndexOf('-');
-        return dash >= 0 && dash < stem.Length - 1 ? stem[(dash + 1)..] : stem;
-    }
-
-    /// <summary>
-    /// Renders one saved label and opens the picture. The job leaves this PC to
-    /// be drawn, so it happens only here, on a menu somebody clicked — never as
-    /// a side effect of printing.
-    /// </summary>
-    private async Task ShowLabelAsync(string zplFile)
-    {
-        try
-        {
-            var dpi = _settings.Destinations
-                .FirstOrDefault(d => string.Equals(
-                    d.Name, DestinationOf(Path.GetFileName(zplFile)), StringComparison.OrdinalIgnoreCase))
-                ?.RenderDpi ?? 0;
-
-            var png = await LabelPreview.RenderAsync(zplFile, dpi);
-
-            using var viewer = System.Diagnostics.Process.Start(
-                new System.Diagnostics.ProcessStartInfo(png) { UseShellExecute = true });
-
-            _log.Info($"Previewed {Path.GetFileName(zplFile)}");
-        }
-        catch (Exception ex)
-        {
-            MessageBox.Show(
-                $"Could not draw that label.\n\n{ex.Message}\n\n"
-                + "Drawing it needs an internet connection — the label is rendered by labelary.com.",
-                "MaplePrint",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Warning);
-        }
-    }
 
     /// <summary>
     /// Prints without going through the API — this is the first thing to try
@@ -371,36 +295,6 @@ public sealed class TrayApplicationContext : ApplicationContext
         return SystemIcons.Application;
     }
 
-    /// <summary>
-    /// Opens the folder saved jobs land in. Says so plainly when the setting is
-    /// off rather than opening an empty folder, which would read as "nothing
-    /// printed" instead of "nothing was being kept".
-    /// </summary>
-    private void ShowSavedJobs()
-    {
-        if (!_settings.SaveJobCopies && !Directory.Exists(JobArchive.Folder))
-        {
-            MessageBox.Show(
-                "Jobs aren't being saved. Turn on \"Keep a copy of each job for troubleshooting\" "
-                + "in Settings, print something, then look here again.\n\n"
-                + "A saved .zpl can be opened at labelary.com to see the label without printing one.",
-                "MaplePrint",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Information);
-            return;
-        }
-
-        try
-        {
-            Directory.CreateDirectory(JobArchive.Folder);
-            using var explorer = System.Diagnostics.Process.Start(
-                new System.Diagnostics.ProcessStartInfo(JobArchive.Folder) { UseShellExecute = true });
-        }
-        catch (Exception ex)
-        {
-            MessageBox.Show($"Could not open {JobArchive.Folder}: {ex.Message}", "MaplePrint");
-        }
-    }
 
     private void BeginInvokeOnUi(Action action)
     {
