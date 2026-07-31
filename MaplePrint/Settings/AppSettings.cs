@@ -46,6 +46,18 @@ public sealed class AppSettings
     /// <summary>Launch on sign-in by registering under HKCU\...\Run.</summary>
     public bool StartWithWindows { get; set; }
 
+    /// <summary>
+    /// Keep a copy of every job on disk. Off by default because a job is a
+    /// customer's order — their name, what they bought — and that should not
+    /// accumulate on a counter PC unless someone asked for it.
+    ///
+    /// <para>On, it answers the question that is otherwise unanswerable from
+    /// this side: what exactly did the caller send? A saved <c>.zpl</c> can be
+    /// dropped into labelary.com to see the label without using a single
+    /// sticker.</para>
+    /// </summary>
+    public bool SaveJobCopies { get; set; }
+
     /// <summary>Per-window size and position, keyed by form name.</summary>
     public Dictionary<string, WindowPlacement> WindowPlacements { get; set; } = new();
 

@@ -48,6 +48,7 @@ public sealed class SettingsForm : Form
     private readonly TextBox _stationName = new();
     private readonly CheckBox _allowRemote = new() { Text = "Accept jobs from other machines on the network", AutoSize = true };
     private readonly CheckBox _startWithWindows = new() { Text = "Start MaplePrint when I sign in", AutoSize = true };
+    private readonly CheckBox _saveJobCopies = new() { Text = "Keep a copy of each job for troubleshooting", AutoSize = true };
     private readonly DataGridView _grid = new();
 
     /// <summary>Below this the grid stops being usable, so the dialog refuses to get shorter.</summary>
@@ -86,6 +87,7 @@ public sealed class SettingsForm : Form
         _stationName.Text = string.IsNullOrWhiteSpace(current.StationName) ? Environment.MachineName : current.StationName;
         _allowRemote.Checked = current.AllowRemote;
         _startWithWindows.Checked = current.StartWithWindows || StartupRegistration.IsEnabled();
+        _saveJobCopies.Checked = current.SaveJobCopies;
 
         BuildGrid(current);
 
@@ -392,6 +394,10 @@ public sealed class SettingsForm : Form
 
         Section("Startup");
         FullWidth(_startWithWindows);
+        FullWidth(_saveJobCopies);
+        Hint("Off by default — a job is a customer's order. On, every job is also written to "
+           + Printing.JobArchive.Folder + ", newest 200 kept. A saved .zpl can be dropped into "
+           + "labelary.com to see the label without printing one.");
     }
 
     /// <summary>A bold heading with a hairline under it, spanning both columns.</summary>
@@ -570,6 +576,7 @@ public sealed class SettingsForm : Form
             StationName = string.IsNullOrWhiteSpace(_stationName.Text) ? Environment.MachineName : _stationName.Text.Trim(),
             Destinations = destinations,
             StartWithWindows = _startWithWindows.Checked,
+            SaveJobCopies = _saveJobCopies.Checked,
 
             // The same dictionary instance, not a copy: this runs before
             // FormClosing captures the final geometry, and sharing the reference

@@ -288,6 +288,12 @@ public sealed class PrintServer : IAsyncDisposable
     {
         try
         {
+            // Before spooling, so a job that the driver then rejects is still on
+            // disk to look at — that is the case worth having a copy of.
+            if (_settings.SaveJobCopies &&
+                JobArchive.Save(destination, contentType, payload, DateTime.Now) is { } saved)
+                _log.Info($"Saved a copy of {label} to {saved}");
+
             // Spooling blocks; keep it off the request thread so a wedged driver
             // can't starve the whole listener.
             var work = Task.Run(() => contentType == ContentTypes.Image

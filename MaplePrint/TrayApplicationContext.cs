@@ -63,6 +63,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("&Settings…", null, (_, _) => ShowSettings());
         menu.Items.Add("&Activity…", null, (_, _) => ShowActivity());
+        menu.Items.Add("Saved &jobs…", null, (_, _) => ShowSavedJobs());
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(_testMenu);
         menu.Items.Add(new ToolStripSeparator());
@@ -293,6 +294,37 @@ public sealed class TrayApplicationContext : ApplicationContext
         catch { }
 
         return SystemIcons.Application;
+    }
+
+    /// <summary>
+    /// Opens the folder saved jobs land in. Says so plainly when the setting is
+    /// off rather than opening an empty folder, which would read as "nothing
+    /// printed" instead of "nothing was being kept".
+    /// </summary>
+    private void ShowSavedJobs()
+    {
+        if (!_settings.SaveJobCopies && !Directory.Exists(JobArchive.Folder))
+        {
+            MessageBox.Show(
+                "Jobs aren't being saved. Turn on \"Keep a copy of each job for troubleshooting\" "
+                + "in Settings, print something, then look here again.\n\n"
+                + "A saved .zpl can be opened at labelary.com to see the label without printing one.",
+                "MaplePrint",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+
+        try
+        {
+            Directory.CreateDirectory(JobArchive.Folder);
+            using var explorer = System.Diagnostics.Process.Start(
+                new System.Diagnostics.ProcessStartInfo(JobArchive.Folder) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Could not open {JobArchive.Folder}: {ex.Message}", "MaplePrint");
+        }
     }
 
     private void BeginInvokeOnUi(Action action)
