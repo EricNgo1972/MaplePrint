@@ -155,8 +155,11 @@ public sealed class ActivityForm : Form
                 // Captured per iteration; the handler must not close over the
                 // loop variable's final value.
                 var path = file.FullName;
+                var kind = file.Extension.Equals(".zpl", StringComparison.OrdinalIgnoreCase)
+                    ? "label"
+                    : "page";
                 menu.Items.Add(
-                    $"{file.LastWriteTime:HH:mm:ss}  {DestinationOf(file.Name)}",
+                    $"{file.LastWriteTime:HH:mm:ss}  {DestinationOf(file.Name)}  ({kind})",
                     null,
                     async (_, _) => await ShowLabelAsync(path));
             }
@@ -183,6 +186,15 @@ public sealed class ActivityForm : Form
     {
         try
         {
+            // A rendered page is already a picture — open it rather than sending
+            // it somewhere to be drawn.
+            if (Path.GetExtension(zplFile).Equals(".png", StringComparison.OrdinalIgnoreCase))
+            {
+                using var image = System.Diagnostics.Process.Start(
+                    new System.Diagnostics.ProcessStartInfo(zplFile) { UseShellExecute = true });
+                return;
+            }
+
             var dpi = _settings.Destinations
                 .FirstOrDefault(d => string.Equals(
                     d.Name, DestinationOf(Path.GetFileName(zplFile)), StringComparison.OrdinalIgnoreCase))

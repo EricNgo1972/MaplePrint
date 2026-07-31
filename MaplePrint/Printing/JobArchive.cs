@@ -52,16 +52,21 @@ public static class JobArchive
     }
 
     /// <summary>
-    /// The most recently saved labels, newest first. Only ZPL: those are the
-    /// ones that can be turned back into a picture, and a list mixing in files
-    /// that can't be previewed would just be a list of disappointments.
+    /// The most recently saved jobs that can be shown as a picture, newest
+    /// first — ZPL, which is drawn on demand, and the rendered pages a document
+    /// destination sends, which already are pictures.
+    ///
+    /// <para>Both, because which one a job is depends on how its destination is
+    /// set up, and nobody looking for "the label that just printed" should have
+    /// to know that. ESC/POS is left out: there is no way to draw it.</para>
     /// </summary>
     public static IReadOnlyList<FileInfo> RecentLabels(int count)
     {
         try
         {
             return new DirectoryInfo(Folder)
-                .GetFiles("*.zpl")
+                .GetFiles()
+                .Where(f => IsViewable(f.Extension))
                 .OrderByDescending(f => f.LastWriteTimeUtc)
                 .Take(count)
                 .ToList();
@@ -71,6 +76,10 @@ public static class JobArchive
             return [];
         }
     }
+
+    public static bool IsViewable(string extension) =>
+        extension.Equals(".zpl", StringComparison.OrdinalIgnoreCase) ||
+        extension.Equals(".png", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// The extension that makes the file open in something useful: the printer's
