@@ -57,9 +57,18 @@ if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed (exit $LASTEXITCODE)." }
 Get-ChildItem $dist -File | Where-Object { $_.Extension -ne '.exe' } | Remove-Item -Force
 Get-ChildItem $dist -Directory | Remove-Item -Recurse -Force
 
-$built = Join-Path $dist 'MaplePrint.exe'
-$named = Join-Path $dist "MaplePrint-$version.exe"
-if (Test-Path $built) { Move-Item $built $named -Force }
+# Deliberately NOT renamed to MaplePrint-$version.exe. Windows takes a process's
+# name from its filename, so a versioned artifact shows up in Task Manager and
+# Get-Process as "MaplePrint-1.1.0" — which means "is it running?" checks and
+# Stop-Process quietly miss it, and a fresh build refuses to start behind an
+# older copy that is still holding the single-instance mutex, with no visible
+# reason why. The version is already carried in the file's own properties, so
+# the filename does not need to repeat it.
+$artifact = Join-Path $dist 'MaplePrint.exe'
+if (-not (Test-Path $artifact)) { throw "Publish produced no MaplePrint.exe in $dist." }
 
-$size = [math]::Round((Get-Item $named).Length / 1MB, 1)
-Write-Host "Done: $named ($size MB)" -ForegroundColor Green
+$size = [math]::Round((Get-Item $artifact).Length / 1MB, 1)
+$stamped = (Get-Item $artifact).VersionInfo.FileVersion
+
+Write-Host "Done: $artifact" -ForegroundColor Green
+Write-Host "      version $stamped, $size MB" -ForegroundColor Green

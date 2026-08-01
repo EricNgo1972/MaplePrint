@@ -284,3 +284,4 @@ python3 tools/make_icon.py                     # regenerate the tray icon
 
 Only one instance may run per machine (a mutex enforces it) — two servers would
 fight over the port, and the second would silently not be listening.
+c
