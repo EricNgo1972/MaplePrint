@@ -41,7 +41,7 @@ public sealed class ActivityForm : Form
             HorizontalScrollbar = true
         };
 
-        // Measured, not sized in pixels. Five buttons of hand-picked widths fit
+        // Measured, not sized in pixels. Six buttons of hand-picked widths fit
         // at one font scale and clip at the next — which is what a button
         // reading "See a" instead of "See a label…" was.
         var bottom = new FlowLayoutPanel
@@ -60,6 +60,7 @@ public sealed class ActivityForm : Form
         var copy = Footer("Copy all");
         var seeLabel = Footer("See a label…");
         var savedJobs = Footer("Saved jobs");
+        var printImage = Footer("Print an image…");
 
         close.Click += (_, _) => Close();
         copy.Click += (_, _) => CopyAll();
@@ -69,12 +70,14 @@ public sealed class ActivityForm : Form
         // The list is built as it drops, not once: the label worth looking at is
         // usually the one that printed thirty seconds ago.
         seeLabel.Click += (_, _) => ShowRecentLabels(seeLabel);
+        printImage.Click += (_, _) => ChooseImageTarget(printImage);
 
         bottom.Controls.Add(close);
         bottom.Controls.Add(openFile);
         bottom.Controls.Add(copy);
         bottom.Controls.Add(seeLabel);
         bottom.Controls.Add(savedJobs);
+        bottom.Controls.Add(printImage);
 
         Controls.Add(_list);
         Controls.Add(bottom);
@@ -215,6 +218,154 @@ public sealed class ActivityForm : Form
                 MessageBoxIcon.Warning);
         }
     }
+
+    /// <summary>
+    /// Which destination to send a picked image to, as a menu under the button.
+    ///
+    /// <para>Only <c>document</c> destinations are offered. A raw one is waiting
+    /// for ESC/POS or ZPL, and a bitmap spooled to it ejects pages of nonsense —
+    /// the mistake the server answers with a 415, and there is no reason for a
+    /// button here to be able to make it.</para>
+    /// </summary>
+    private void ChooseImageTarget(Control anchor)
+    {
+        var menu = new ContextMenuStrip();
+        var targets = _settings.Destinations
+            .Where(d => d.Kind == DestinationKind.Document)
+            .ToList();
+
+        if (targets.Count == 0)
+        {
+            menu.Items.Add(new ToolStripMenuItem("No document destinations are set up") { Enabled = false });
+        }
+        else
+        {
+            foreach (var destination in targets)
+            {
+                // Captured per iteration; the handler must not close over the
+                // loop variable's final value.
+                var target = destination;
+                menu.Items.Add(
+                    $"{target.Name}  ({Shorten(target.Queue)})",
+                    null,
+                    (_, _) => PrintPickedImage(target));
+            }
+        }
+
+        menu.Show(anchor, new Point(0, -menu.PreferredSize.Height));
+    }
+
+    /// <summary>
+    /// Prints an image the operator picks — a saved job, or any PNG dropped in
+    /// the folder — to <paramref name="destination"/>.
+    ///
+    /// <para>The point of it is the fault it was written for: a receipt arrived
+    /// from the caller intact and came out of the printer clipped, and proving
+    /// that meant re-running a real order every time. Now the payload on disk
+    /// can be sent again on its own, as many times as it takes, with no till and
+    /// no customer involved.</para>
+    ///
+    /// <para>Deliberately the same two calls a job off the network makes —
+    /// <see cref="ImageDecoder.Decode"/> then <see cref="DocumentPrinter.Print"/>
+    /// — rather than a shortcut to the printer. A diagnostic that skips a stage
+    /// is blind to the stage it skipped: the tray's own test print composes its
+    /// bitmap in memory and never decodes anything, and that is precisely why it
+    /// kept coming out perfect while every real job was mangled. This one has to
+    /// be able to reproduce the fault, so it takes the whole path.</para>
+    /// </summary>
+    private void PrintPickedImage(Destination destination)
+    {
+        if (!destination.IsConfigured)
+        {
+            MessageBox.Show(
+                $"'{destination.Name}' has no printer assigned. Set one in Settings first.",
+                "MaplePrint", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        if (!PrinterQueues.Exists(destination.Queue))
+        {
+            MessageBox.Show(
+                $"The queue '{destination.Queue}' is not installed on this PC.",
+                "MaplePrint", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        using var picker = new OpenFileDialog
+        {
+            Title = $"Send an image to {destination.Name}",
+            Filter = "Images (*.png;*.jpg;*.jpeg;*.bmp)|*.png;*.jpg;*.jpeg;*.bmp|All files (*.*)|*.*",
+            CheckFileExists = true
+        };
+
+        // Opens where the jobs land, because the file somebody wants to send
+        // again is almost always the one that just went wrong.
+        if (Directory.Exists(JobArchive.Folder)) picker.InitialDirectory = JobArchive.Folder;
+
+        if (picker.ShowDialog(this) != DialogResult.OK) return;
+
+        var path = picker.FileName;
+        var name = Path.GetFileName(path);
+
+        byte[] payload;
+        try
+        {
+            payload = File.ReadAllBytes(path);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Could not read {name}: {ex.Message}", "MaplePrint",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        var (image, decodeError) = ImageDecoder.Decode(payload);
+        if (image is null)
+        {
+            _log.Error($"Could not send {name} to {destination.Name}: {decodeError}");
+            MessageBox.Show(decodeError, "MaplePrint", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        string? error;
+        using (image)
+        {
+            // Says what it is before it says how big, so the log shows whether
+            // the artwork matched the destination it was sent to — which is the
+            // first thing to check when a page comes out the wrong size.
+            _log.Info($"Sending {name} ({image.Width}x{image.Height} at {destination.RenderDpi} dpi) "
+                    + $"to {destination.Name}.");
+
+            // Spooling blocks — DocumentPrinter joins its own STA thread — so
+            // the window would otherwise sit there looking hung.
+            var previous = Cursor;
+            Cursor = Cursors.WaitCursor;
+            try
+            {
+                error = DocumentPrinter.Print(
+                    destination.Queue, image, $"MaplePrint — {name}",
+                    paperSizeName: destination.PaperSizeName,
+                    renderDpi: destination.RenderDpi,
+                    note: _log.Info);
+            }
+            finally
+            {
+                Cursor = previous;
+            }
+        }
+
+        if (error is null)
+        {
+            _log.Success($"Sent {name} -> {destination.Name} ({destination.Queue}).");
+            return;
+        }
+
+        _log.Error($"Sending {name} to {destination.Name} failed: {error}");
+        MessageBox.Show(error, "MaplePrint", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+    }
+
+    private static string Shorten(string value) =>
+        value.Length <= 34 ? value : value[..31] + "…";
 
     /// <summary>
     /// Opens the folder saved jobs land in. Says so plainly when the setting is
