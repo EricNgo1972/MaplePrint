@@ -1,3 +1,4 @@
+using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Runtime.Versioning;
 
@@ -43,10 +44,29 @@ public static class ImageDecoder
             // thermal head to decide what an alpha channel means — which it
             // does badly, usually by printing it solid black.
             var copy = new Bitmap(decoded.Width, decoded.Height, PixelFormat.Format32bppPArgb);
+
+            // The canvas must carry the artwork's own resolution, not the
+            // screen's. A new Bitmap is stamped with whatever DPI GDI+ read off
+            // the desktop at startup — 144 on a counter PC running at 150% —
+            // and every drawing call below is then measured against that.
+            copy.SetResolution(decoded.HorizontalResolution, decoded.VerticalResolution);
+
             using (var g = Graphics.FromImage(copy))
             {
+                // Pixel for pixel, stated three ways, because the obvious call
+                // for this is a trap: DrawImageUnscaled is not unscaled. It
+                // forwards to the physical-size overload, which scales by
+                // graphics-DPI over image-DPI — so a 96 dpi PNG landing on a
+                // 144 dpi canvas was drawn at 150% and clipped to the top-left
+                // corner. Perfectly on a 96 dpi PC, ruined on a scaled one, and
+                // MaplePrint's own test print never came through here to show it.
+                g.PageUnit = GraphicsUnit.Pixel;
+                g.InterpolationMode = InterpolationMode.NearestNeighbor;
+                g.PixelOffsetMode = PixelOffsetMode.Half;
+                g.SmoothingMode = SmoothingMode.None;
+
                 g.Clear(Color.White);
-                g.DrawImageUnscaled(decoded, 0, 0);
+                g.DrawImage(decoded, new Rectangle(0, 0, decoded.Width, decoded.Height));
             }
 
             return (copy, null);
