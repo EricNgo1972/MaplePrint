@@ -37,7 +37,7 @@ public sealed class SettingsForm : Form
     /// </summary>
     private const string NoPrinter = "(none)";
 
-    /// <summary>"This printer has no cash drawer" in the Drawer command column.
+    /// <summary>"This printer has no cash drawer" in the Cash drawer column.
     /// Blank is what gets stored, and blank is the flag — a destination with no
     /// drawer command has no drawer.</summary>
     private const string NoDrawer = "(none)";
@@ -195,7 +195,7 @@ public sealed class SettingsForm : Form
             .ToArray();
 
         var enabled = new DataGridViewCheckBoxColumn { HeaderText = "On", Width = 44, ToolTipText = "Accept jobs for this destination" };
-        var name = new DataGridViewTextBoxColumn { HeaderText = "Name", Width = 100, ToolTipText = "What callers put in \"destination\"" };
+        var name = new DataGridViewTextBoxColumn { HeaderText = "Name", Width = 120, ToolTipText = "What callers put in \"destination\"" };
 
         var queue = new DataGridViewComboBoxColumn
         {
@@ -210,9 +210,10 @@ public sealed class SettingsForm : Form
         var kind = new DataGridViewComboBoxColumn
         {
             HeaderText = "Kind",
-            // Wide enough for "Document" plus the dropdown arrow; narrower and
-            // it renders as "Docum...", which reads as a bug rather than a value.
-            Width = 168,
+            // Wide enough for the longest item — "Raw — ZPL (Zebra)" — plus the
+            // dropdown arrow. Narrower and it renders as "Raw — ZPL (Z...", which
+            // reads as a bug rather than as a value.
+            Width = 190,
             FlatStyle = FlatStyle.Flat,
             DisplayStyle = DataGridViewComboBoxDisplayStyle.ComboBox,
             ToolTipText = "Document = a rendered page, works on any printer. Raw = device bytes, straight to the printer's own language."
@@ -226,7 +227,8 @@ public sealed class SettingsForm : Form
         var width = new DataGridViewComboBoxColumn
         {
             HeaderText = "Paper",
-            Width = 116,
+            // "80 mm receipt" and "2.2″ label" both have to fit beside the arrow.
+            Width = 148,
             FlatStyle = FlatStyle.Flat,
             DisplayStyle = DataGridViewComboBoxDisplayStyle.ComboBox,
             ToolTipText = "The roll that is loaded. Sets Dots for you."
@@ -234,28 +236,33 @@ public sealed class SettingsForm : Form
         width.Items.AddRange([.. PaperWidths.All.Select(p => p.Name)]);
         width.Items.Add(PaperWidths.Custom);
 
-        var dots = new DataGridViewTextBoxColumn { HeaderText = "Dots", Width = 58, ToolTipText = "Printable width in dots, advertised to callers. Set by Paper, or type it for an odd printer." };
-        var dpi = new DataGridViewTextBoxColumn { HeaderText = "DPI", Width = 48, ToolTipText = "Resolution the caller's artwork is drawn at" };
-        var paper = new DataGridViewTextBoxColumn { HeaderText = "Paper form", Width = 118, ToolTipText = "Blank = the driver's own setting. Or a form name, or \"auto\"." };
+        var dots = new DataGridViewTextBoxColumn { HeaderText = "Dots", Width = 64, ToolTipText = "Printable width in dots, advertised to callers. Set by Paper, or type it for an odd printer." };
+        var dpi = new DataGridViewTextBoxColumn { HeaderText = "DPI", Width = 56, ToolTipText = "Resolution the caller's artwork is drawn at" };
+        var paper = new DataGridViewTextBoxColumn { HeaderText = "Paper form", Width = 132, ToolTipText = "Blank = the driver's own setting. Or a form name, or \"auto\"." };
 
         // The drawer is wired to the receipt printer's DK port, so it belongs to
         // a destination rather than to the station: a café has a counter printer
         // with a till under it and a kitchen printer without one.
-        var drawerOn = new DataGridViewCheckBoxColumn
-        {
-            HeaderText = "Drawer",
-            Width = 58,
-            ToolTipText = "A cash drawer is wired into this printer's DK port"
-        };
-
+        //
+        // One control, not two. There was a Drawer tick beside this, and its
+        // value was derived from this column — (none) meant unticked and a
+        // command meant ticked — so the pair had to be kept in step by hand in
+        // both directions, and on save the tick silently won. That is the same
+        // "second way to say the same thing" the stored model rejects, where
+        // blank DrawerCommand is what "no drawer" means. Picking (none) here is
+        // one click, exactly as the tick was.
         var drawerCmd = new DataGridViewComboBoxColumn
         {
-            HeaderText = "Drawer command",
-            Width = 196,
+            HeaderText = "Cash drawer",
+            // The longest item is "ESC/POS (Epson, Bixolon, Citizen, …)", and
+            // truncating it hides the brand list that is the whole point of it:
+            // nobody knows their command set, they know their printer's badge.
+            Width = 268,
             FlatStyle = FlatStyle.Flat,
             DisplayStyle = DataGridViewComboBoxDisplayStyle.ComboBox,
-            ToolTipText = "Which language fires the drawer. Guessed from the printer name — "
-                        + "prove it with Open drawer, and change it if nothing moves."
+            ToolTipText = "Which language fires the drawer wired into this printer's DK port. "
+                        + "(none) means there is no drawer. Prove the choice with Open drawer, "
+                        + "and change it if nothing moves."
         };
         drawerCmd.Items.Add(NoDrawer);
         drawerCmd.Items.AddRange([.. PrinterCommandSets.All.Select(c => c.Title)]);
@@ -263,14 +270,17 @@ public sealed class SettingsForm : Form
         var drawerPulse = new DataGridViewTextBoxColumn
         {
             HeaderText = "Pulse ms",
-            Width = 70,
-            ToolTipText = "How long the solenoid is driven. 200 suits most drawers; some latches need 250–300."
+            Width = 84,
+            // The range is per command set, because the pulse byte's unit is:
+            // 10 ms on Star, 2 ms on ESC/POS. Stored in milliseconds either way.
+            ToolTipText = "How long the solenoid is driven, in milliseconds. 200 suits most drawers; "
+                        + "some latches need 250–300. Star accepts 10–1270, ESC/POS 2–510."
         };
 
         var drawerUnit = new DataGridViewTextBoxColumn
         {
             HeaderText = "Unit",
-            Width = 48,
+            Width = 56,
             ToolTipText = "Peripheral unit the printer drives: 1, or 2 for a second drawer"
         };
 
@@ -283,14 +293,14 @@ public sealed class SettingsForm : Form
             HeaderText = "",
             Text = "Open drawer",
             UseColumnTextForButtonValue = true,
-            Width = 104,
+            Width = 124,
             FlatStyle = FlatStyle.Standard,
             ToolTipText = "Fire this drawer now, using the settings in this row — no need to save first"
         };
 
         _grid.Columns.AddRange(
             enabled, name, queue, kind, width, dots, dpi, paper,
-            drawerOn, drawerCmd, drawerPulse, drawerUnit, drawerTest);
+            drawerCmd, drawerPulse, drawerUnit, drawerTest);
 
         _populating = true;
         foreach (var d in current.Destinations) AddRow(d);
@@ -302,7 +312,7 @@ public sealed class SettingsForm : Form
         _grid.CurrentCellDirtyStateChanged += (_, _) =>
         {
             if (_grid.IsCurrentCellDirty &&
-                _grid.CurrentCell?.ColumnIndex is ColPaperWidth or ColDrawerOn or ColDrawerCmd)
+                _grid.CurrentCell?.ColumnIndex is ColPaperWidth or ColDrawerCmd)
                 _grid.CommitEdit(DataGridViewDataErrorContexts.Commit);
         };
 
@@ -322,47 +332,33 @@ public sealed class SettingsForm : Form
                 row.Cells[ColDots].Value = computed.ToString();
         };
 
-        // Ticking Drawer fills in a guess rather than asking a shop owner which
-        // command language their printer speaks. It is only ever a default: the
-        // Open drawer button beside it settles whether the guess was right, and
-        // a wrong one costs a dropdown change rather than a support call.
+        // Naming a command set fills in a pulse and a unit, so that setting a
+        // drawer up is one choice rather than three. 200 ms on unit 1 is the
+        // common drawer, and it is legal for both sets — 10–1270 ms on Star,
+        // 2–510 ms on ESC/POS, since the pulse byte's unit differs. The Open
+        // drawer button beside it settles whether the choice was right.
         _grid.CellValueChanged += (_, e) =>
         {
-            if (_populating || e.RowIndex < 0) return;
+            if (_populating || e.RowIndex < 0 || e.ColumnIndex != ColDrawerCmd) return;
 
             var row = _grid.Rows[e.RowIndex];
 
-            if (e.ColumnIndex == ColDrawerOn)
+            if (DrawerCommandFromLabel(CellText(row, ColDrawerCmd)) is null)
             {
-                if (row.Cells[ColDrawerOn].Value is not true)
-                {
-                    // Cleared, not remembered. Blank is what "no drawer" is.
-                    row.Cells[ColDrawerCmd].Value = NoDrawer;
-                    row.Cells[ColDrawerPulse].Value = "";
-                    row.Cells[ColDrawerUnit].Value = "";
-                    return;
-                }
-
-                if (DrawerCommandFromLabel(CellText(row, ColDrawerCmd)) is not null) return;
-
-                var queue = CellText(row, ColQueue).Trim();
-                if (string.Equals(queue, NoPrinter, StringComparison.OrdinalIgnoreCase)) queue = "";
-
-                var guess = PrinterCommandSets.For(PrinterCommandSets.GuessFor(queue));
-                row.Cells[ColDrawerCmd].Value = guess?.Title ?? NoDrawer;
-                row.Cells[ColDrawerPulse].Value = Destination.DefaultDrawerPulseMs.ToString();
-                row.Cells[ColDrawerUnit].Value = "1";
+                // Cleared, not remembered. Blank is what "no drawer" is.
+                row.Cells[ColDrawerPulse].Value = "";
+                row.Cells[ColDrawerUnit].Value = "";
                 return;
             }
 
-            // Choosing (none) in the command column is the other way of saying
-            // this printer has no drawer, so the tick follows it.
-            if (e.ColumnIndex == ColDrawerCmd && DrawerCommandFromLabel(CellText(row, ColDrawerCmd)) is null)
-            {
-                row.Cells[ColDrawerOn].Value = false;
-                row.Cells[ColDrawerPulse].Value = "";
-                row.Cells[ColDrawerUnit].Value = "";
-            }
+            // Only when there is nothing there. A pulse somebody tuned to their
+            // latch must survive switching the command set — it is stored in
+            // milliseconds precisely so it means the same thing to both.
+            if (string.IsNullOrWhiteSpace(CellText(row, ColDrawerPulse)))
+                row.Cells[ColDrawerPulse].Value = Destination.DefaultDrawerPulseMs.ToString();
+
+            if (string.IsNullOrWhiteSpace(CellText(row, ColDrawerUnit)))
+                row.Cells[ColDrawerUnit].Value = "1";
         };
 
         _grid.CellContentClick += (_, e) =>
@@ -390,11 +386,10 @@ public sealed class SettingsForm : Form
     private const int ColDots = 5;
     private const int ColDpi = 6;
     private const int ColPaperForm = 7;
-    private const int ColDrawerOn = 8;
-    private const int ColDrawerCmd = 9;
-    private const int ColDrawerPulse = 10;
-    private const int ColDrawerUnit = 11;
-    private const int ColDrawerTest = 12;
+    private const int ColDrawerCmd = 8;
+    private const int ColDrawerPulse = 9;
+    private const int ColDrawerUnit = 10;
+    private const int ColDrawerTest = 11;
 
     private void AddRow(Destination d) =>
         _grid.Rows.Add(
@@ -408,7 +403,6 @@ public sealed class SettingsForm : Form
             d.DotWidth > 0 ? d.DotWidth.ToString() : "",
             d.RenderDpi > 0 ? d.RenderDpi.ToString() : Destination.DefaultRenderDpi.ToString(),
             d.PaperSizeName ?? "",
-            d.HasDrawer,
             DrawerLabel(d),
             d.HasDrawer ? d.EffectiveDrawerPulseMs.ToString() : "",
             d.HasDrawer ? d.EffectiveDrawerUnit.ToString() : "");
@@ -463,7 +457,7 @@ public sealed class SettingsForm : Form
     private void ShowAdvancedColumns(bool visible)
     {
         foreach (var column in new[]
-                 { ColDots, ColDpi, ColPaperForm, ColDrawerOn, ColDrawerCmd, ColDrawerPulse, ColDrawerUnit, ColDrawerTest })
+                 { ColDots, ColDpi, ColPaperForm, ColDrawerCmd, ColDrawerPulse, ColDrawerUnit, ColDrawerTest })
             if (column < _grid.Columns.Count) _grid.Columns[column].Visible = visible;
     }
 
@@ -483,7 +477,7 @@ public sealed class SettingsForm : Form
 
             // A drawer that is set up must be visible, or nobody can see which
             // command set is in force when it stops opening.
-            if (row.Cells[ColDrawerOn].Value is true) return true;
+            if (DrawerCommandFromLabel(CellText(row, ColDrawerCmd)) is not null) return true;
 
             if (string.Equals(CellText(row, ColPaperWidth), PaperWidths.Custom, StringComparison.Ordinal) &&
                 !string.IsNullOrWhiteSpace(CellText(row, ColDots)))
@@ -751,11 +745,9 @@ public sealed class SettingsForm : Form
             var queue = CellText(row, ColQueue).Trim();
             if (string.Equals(queue, NoPrinter, StringComparison.OrdinalIgnoreCase)) queue = "";
 
-            // Blank is the flag: no drawer command means no drawer, so an
-            // unticked row simply writes nothing rather than a disabled drawer.
-            var drawerCommand = row.Cells[ColDrawerOn].Value is true
-                ? DrawerCommandFromLabel(CellText(row, ColDrawerCmd))
-                : null;
+            // Blank is the flag: no drawer command means no drawer, so a row
+            // left on (none) simply writes nothing rather than a disabled drawer.
+            var drawerCommand = DrawerCommandFromLabel(CellText(row, ColDrawerCmd));
 
             if (!TryPositive(CellText(row, ColDrawerPulse), out var pulse, allowBlank: true))
             {
@@ -902,11 +894,11 @@ public sealed class SettingsForm : Form
     private static string Shorten(string value) =>
         value.Length <= 40 ? value : value[..37] + "…";
 
-    /// <summary>How a stored destination reads in the Drawer command column.</summary>
+    /// <summary>How a stored destination reads in the Cash drawer column.</summary>
     private static string DrawerLabel(Destination d) =>
         PrinterCommandSets.For(d.DrawerCommand)?.Title ?? NoDrawer;
 
-    /// <summary>The Drawer command column back into what a destination stores,
+    /// <summary>The Cash drawer column back into what a destination stores,
     /// or null for "(none)" and anything unrecognised — both of which mean no
     /// drawer.</summary>
     private static string? DrawerCommandFromLabel(string label)

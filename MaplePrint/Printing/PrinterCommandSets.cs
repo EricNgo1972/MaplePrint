@@ -130,13 +130,13 @@ public static class PrinterCommandSets
         destination.HasDrawer ? For(destination.DrawerCommand) : null;
 
     /// <summary>
-    /// A starting guess from the queue name, offered as the default when someone
-    /// first gives a destination a drawer.
+    /// A starting guess from the queue name. ESC/POS is the fallback because it
+    /// is most of the market; Star is the named exception.
     ///
-    /// <para>ESC/POS is the fallback because it is most of the market; Star is
-    /// the named exception. This is only ever a default — the operator confirms
-    /// it with the <c>Open drawer</c> button beside it, and a wrong guess costs
-    /// one dropdown change rather than a support call.</para>
+    /// <para>Never applied on its own. The Settings grid names both sets by the
+    /// brands on the box, which is a better question to ask an operator than any
+    /// guess — this exists so <c>--self-test</c> can assert the mapping, and so a
+    /// caller that wants a default has one.</para>
     /// </summary>
     public static string GuessFor(string? queueName)
     {
