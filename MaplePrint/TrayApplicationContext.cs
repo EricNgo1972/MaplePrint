@@ -22,6 +22,13 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly Control _marshal;
     private readonly PrintServer _server;
 
+    /// <summary>
+    /// How long Exit waits for the server to drain before leaving anyway. Long
+    /// enough for Kestrel and a printer queue to finish (5s each), short enough
+    /// that nobody at a counter concludes it has hung.
+    /// </summary>
+    private static readonly TimeSpan ShutdownTimeout = TimeSpan.FromSeconds(12);
+
     private AppSettings _settings;
     private ActivityForm? _activityForm;
 
@@ -70,7 +77,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         menu.Items.Add(new ToolStripSeparator());
         // Fully qualified: an unqualified "Help" binds to System.Windows.Forms.Help.
         menu.Items.Add("&Help", null, (_, _) => MaplePrint.Help.HelpDocument.Show());
-        menu.Items.Add("E&xit", null, (_, _) => ExitThread());
+        menu.Items.Add("E&xit", null, (_, _) => Exit());
 
         _tray = new NotifyIcon
         {
@@ -82,6 +89,11 @@ public sealed class TrayApplicationContext : ApplicationContext
         _tray.DoubleClick += (_, _) => ShowActivity();
 
         _log.Info($"MaplePrint {PrintServer.Version} started.");
+
+        // Checked every start, not only when Settings is saved: the entry points
+        // at a path, and this .exe moves.
+        if (StartupRegistration.Reconcile(_settings.StartWithWindows))
+            _log.Info("Registered MaplePrint to start at sign-in — the entry was missing or pointed elsewhere.");
 
         RebuildTestMenu();
         _ = _server.StartAsync();
@@ -302,6 +314,18 @@ public sealed class TrayApplicationContext : ApplicationContext
         else action();
     }
 
+    /// <summary>
+    /// The icon goes first, before any draining starts, so Exit is visibly
+    /// taking effect. Otherwise the shop clicks it again — and a second Exit
+    /// while the first is still shutting down is how this ends up looking
+    /// broken even when it works.
+    /// </summary>
+    private void Exit()
+    {
+        _tray.Visible = false;
+        ExitThread();
+    }
+
     protected override void Dispose(bool disposing)
     {
         if (disposing)
@@ -310,9 +334,22 @@ public sealed class TrayApplicationContext : ApplicationContext
             // user hovers over it.
             _tray.Visible = false;
             _server.StateChanged -= OnStateChanged;
-            _server.DisposeAsync().AsTask().GetAwaiter().GetResult();
+
+            // On the thread pool, deliberately, and never inline on this one.
+            // Awaits inside the shutdown resume on the context that started it,
+            // and this thread's is a WinForms message loop that has already
+            // ended — blocking on it here is a process that never leaves Task
+            // Manager, which is exactly what the counter saw. Bounded as well,
+            // so a wedged driver cannot hold Exit open either.
+            var shutdown = Task.Run(() => _server.DisposeAsync().AsTask());
+
+            if (!shutdown.Wait(ShutdownTimeout))
+                _log.Error($"The print server did not shut down within {ShutdownTimeout.TotalSeconds:0}s; exiting anyway.");
+
+            _activityForm?.Dispose();
             _tray.Dispose();
             _marshal.Dispose();
+            _log.Info("MaplePrint stopped.");
         }
 
         base.Dispose(disposing);

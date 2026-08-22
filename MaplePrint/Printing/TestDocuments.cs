@@ -7,9 +7,9 @@ namespace MaplePrint.Printing;
 
 /// <summary>
 /// Self-contained test payloads, so a technician can prove the paper path works
-/// before the server is even reachable. These are the only two places in the
-/// agent that know what a printer language looks like — real jobs arrive
-/// pre-encoded from MapleCoffee.
+/// before the server is even reachable. This and <see cref="PrinterCommands"/>
+/// are the only places in the agent that know what a printer language looks
+/// like — real jobs arrive pre-encoded from MapleCoffee.
 /// </summary>
 public static class TestDocuments
 {

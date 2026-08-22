@@ -1,4 +1,4 @@
-using System.Runtime.Versioning;
+﻿using System.Runtime.Versioning;
 
 namespace MaplePrint;
 
@@ -28,6 +28,15 @@ internal static class Program
         if (args.Length >= 2 && string.Equals(args[0], "--print-test", StringComparison.OrdinalIgnoreCase))
         {
             RunPrintTest(args[1], args.Length >= 3 ? args[2] : null, args.Length >= 4 ? args[3] : null);
+            return;
+        }
+
+        // The checks that need no printer. Before the mutex like the others, so
+        // it is runnable on the counter PC that is misbehaving while the tray
+        // copy is still running.
+        if (args.Length >= 1 && string.Equals(args[0], "--self-test", StringComparison.OrdinalIgnoreCase))
+        {
+            Environment.Exit(Diagnostics.SelfTest.Run(args.Length >= 2 ? args[1] : null));
             return;
         }
 

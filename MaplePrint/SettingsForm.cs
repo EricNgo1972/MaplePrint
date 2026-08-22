@@ -1,4 +1,5 @@
-using System.Runtime.Versioning;
+﻿using System.Runtime.Versioning;
+using MaplePrint.Diagnostics;
 using MaplePrint.Printing;
 using MaplePrint.Settings;
 using MaplePrint.UI;
@@ -35,6 +36,11 @@ public sealed class SettingsForm : Form
     /// unambiguous to the code and clearer to read than a blank cell.
     /// </summary>
     private const string NoPrinter = "(none)";
+
+    /// <summary>"This printer has no cash drawer" in the Drawer command column.
+    /// Blank is what gets stored, and blank is the flag — a destination with no
+    /// drawer command has no drawer.</summary>
+    private const string NoDrawer = "(none)";
 
     private readonly NumericUpDown _listenPort = new()
     {
@@ -232,7 +238,59 @@ public sealed class SettingsForm : Form
         var dpi = new DataGridViewTextBoxColumn { HeaderText = "DPI", Width = 48, ToolTipText = "Resolution the caller's artwork is drawn at" };
         var paper = new DataGridViewTextBoxColumn { HeaderText = "Paper form", Width = 118, ToolTipText = "Blank = the driver's own setting. Or a form name, or \"auto\"." };
 
-        _grid.Columns.AddRange(enabled, name, queue, kind, width, dots, dpi, paper);
+        // The drawer is wired to the receipt printer's DK port, so it belongs to
+        // a destination rather than to the station: a café has a counter printer
+        // with a till under it and a kitchen printer without one.
+        var drawerOn = new DataGridViewCheckBoxColumn
+        {
+            HeaderText = "Drawer",
+            Width = 58,
+            ToolTipText = "A cash drawer is wired into this printer's DK port"
+        };
+
+        var drawerCmd = new DataGridViewComboBoxColumn
+        {
+            HeaderText = "Drawer command",
+            Width = 196,
+            FlatStyle = FlatStyle.Flat,
+            DisplayStyle = DataGridViewComboBoxDisplayStyle.ComboBox,
+            ToolTipText = "Which language fires the drawer. Guessed from the printer name — "
+                        + "prove it with Open drawer, and change it if nothing moves."
+        };
+        drawerCmd.Items.Add(NoDrawer);
+        drawerCmd.Items.AddRange([.. PrinterCommandSets.All.Select(c => c.Title)]);
+
+        var drawerPulse = new DataGridViewTextBoxColumn
+        {
+            HeaderText = "Pulse ms",
+            Width = 70,
+            ToolTipText = "How long the solenoid is driven. 200 suits most drawers; some latches need 250–300."
+        };
+
+        var drawerUnit = new DataGridViewTextBoxColumn
+        {
+            HeaderText = "Unit",
+            Width = 48,
+            ToolTipText = "Peripheral unit the printer drives: 1, or 2 for a second drawer"
+        };
+
+        // Spooled is not obeyed. Nothing here reads a reply from the printer, so
+        // the only proof the command set is right is a drawer that opens — which
+        // is why the test sits in the row beside the setting rather than behind a
+        // save and a menu.
+        var drawerTest = new DataGridViewButtonColumn
+        {
+            HeaderText = "",
+            Text = "Open drawer",
+            UseColumnTextForButtonValue = true,
+            Width = 104,
+            FlatStyle = FlatStyle.Standard,
+            ToolTipText = "Fire this drawer now, using the settings in this row — no need to save first"
+        };
+
+        _grid.Columns.AddRange(
+            enabled, name, queue, kind, width, dots, dpi, paper,
+            drawerOn, drawerCmd, drawerPulse, drawerUnit, drawerTest);
 
         _populating = true;
         foreach (var d in current.Destinations) AddRow(d);
@@ -243,7 +301,8 @@ public sealed class SettingsForm : Form
         // appeared after clicking away would read as not having taken.
         _grid.CurrentCellDirtyStateChanged += (_, _) =>
         {
-            if (_grid.IsCurrentCellDirty && _grid.CurrentCell?.ColumnIndex == ColPaperWidth)
+            if (_grid.IsCurrentCellDirty &&
+                _grid.CurrentCell?.ColumnIndex is ColPaperWidth or ColDrawerOn or ColDrawerCmd)
                 _grid.CommitEdit(DataGridViewDataErrorContexts.Commit);
         };
 
@@ -263,6 +322,60 @@ public sealed class SettingsForm : Form
                 row.Cells[ColDots].Value = computed.ToString();
         };
 
+        // Ticking Drawer fills in a guess rather than asking a shop owner which
+        // command language their printer speaks. It is only ever a default: the
+        // Open drawer button beside it settles whether the guess was right, and
+        // a wrong one costs a dropdown change rather than a support call.
+        _grid.CellValueChanged += (_, e) =>
+        {
+            if (_populating || e.RowIndex < 0) return;
+
+            var row = _grid.Rows[e.RowIndex];
+
+            if (e.ColumnIndex == ColDrawerOn)
+            {
+                if (row.Cells[ColDrawerOn].Value is not true)
+                {
+                    // Cleared, not remembered. Blank is what "no drawer" is.
+                    row.Cells[ColDrawerCmd].Value = NoDrawer;
+                    row.Cells[ColDrawerPulse].Value = "";
+                    row.Cells[ColDrawerUnit].Value = "";
+                    return;
+                }
+
+                if (DrawerCommandFromLabel(CellText(row, ColDrawerCmd)) is not null) return;
+
+                var queue = CellText(row, ColQueue).Trim();
+                if (string.Equals(queue, NoPrinter, StringComparison.OrdinalIgnoreCase)) queue = "";
+
+                var guess = PrinterCommandSets.For(PrinterCommandSets.GuessFor(queue));
+                row.Cells[ColDrawerCmd].Value = guess?.Title ?? NoDrawer;
+                row.Cells[ColDrawerPulse].Value = Destination.DefaultDrawerPulseMs.ToString();
+                row.Cells[ColDrawerUnit].Value = "1";
+                return;
+            }
+
+            // Choosing (none) in the command column is the other way of saying
+            // this printer has no drawer, so the tick follows it.
+            if (e.ColumnIndex == ColDrawerCmd && DrawerCommandFromLabel(CellText(row, ColDrawerCmd)) is null)
+            {
+                row.Cells[ColDrawerOn].Value = false;
+                row.Cells[ColDrawerPulse].Value = "";
+                row.Cells[ColDrawerUnit].Value = "";
+            }
+        };
+
+        _grid.CellContentClick += (_, e) =>
+        {
+            if (e.RowIndex < 0 || e.ColumnIndex != ColDrawerTest) return;
+
+            // Committed first so the button tests what is on screen, including a
+            // command set changed a second ago. Testing the saved settings
+            // instead would break the whole try-it-and-see loop.
+            _grid.EndEdit();
+            TestDrawer(_grid.Rows[e.RowIndex]);
+        };
+
         // A queue or kind that isn't in the list would otherwise raise a modal
         // DataError at the user; there is nothing they could do about it.
         _grid.DataError += (_, e) => e.ThrowException = false;
@@ -277,6 +390,11 @@ public sealed class SettingsForm : Form
     private const int ColDots = 5;
     private const int ColDpi = 6;
     private const int ColPaperForm = 7;
+    private const int ColDrawerOn = 8;
+    private const int ColDrawerCmd = 9;
+    private const int ColDrawerPulse = 10;
+    private const int ColDrawerUnit = 11;
+    private const int ColDrawerTest = 12;
 
     private void AddRow(Destination d) =>
         _grid.Rows.Add(
@@ -289,7 +407,11 @@ public sealed class SettingsForm : Form
             PaperWidths.NameFor(d.DotWidth, d.RenderDpi),
             d.DotWidth > 0 ? d.DotWidth.ToString() : "",
             d.RenderDpi > 0 ? d.RenderDpi.ToString() : Destination.DefaultRenderDpi.ToString(),
-            d.PaperSizeName ?? "");
+            d.PaperSizeName ?? "",
+            d.HasDrawer,
+            DrawerLabel(d),
+            d.HasDrawer ? d.EffectiveDrawerPulseMs.ToString() : "",
+            d.HasDrawer ? d.EffectiveDrawerUnit.ToString() : "");
 
     private Control GridButtons()
     {
@@ -340,7 +462,8 @@ public sealed class SettingsForm : Form
 
     private void ShowAdvancedColumns(bool visible)
     {
-        foreach (var column in new[] { ColDots, ColDpi, ColPaperForm })
+        foreach (var column in new[]
+                 { ColDots, ColDpi, ColPaperForm, ColDrawerOn, ColDrawerCmd, ColDrawerPulse, ColDrawerUnit, ColDrawerTest })
             if (column < _grid.Columns.Count) _grid.Columns[column].Visible = visible;
     }
 
@@ -357,6 +480,10 @@ public sealed class SettingsForm : Form
             if (row.IsNewRow) continue;
 
             if (!string.IsNullOrWhiteSpace(CellText(row, ColPaperForm))) return true;
+
+            // A drawer that is set up must be visible, or nobody can see which
+            // command set is in force when it stops opening.
+            if (row.Cells[ColDrawerOn].Value is true) return true;
 
             if (string.Equals(CellText(row, ColPaperWidth), PaperWidths.Custom, StringComparison.Ordinal) &&
                 !string.IsNullOrWhiteSpace(CellText(row, ColDots)))
@@ -624,7 +751,25 @@ public sealed class SettingsForm : Form
             var queue = CellText(row, ColQueue).Trim();
             if (string.Equals(queue, NoPrinter, StringComparison.OrdinalIgnoreCase)) queue = "";
 
-            destinations.Add(new Destination
+            // Blank is the flag: no drawer command means no drawer, so an
+            // unticked row simply writes nothing rather than a disabled drawer.
+            var drawerCommand = row.Cells[ColDrawerOn].Value is true
+                ? DrawerCommandFromLabel(CellText(row, ColDrawerCmd))
+                : null;
+
+            if (!TryPositive(CellText(row, ColDrawerPulse), out var pulse, allowBlank: true))
+            {
+                problem = $"'{name}': Pulse ms must be a whole number of milliseconds, or blank.";
+                return false;
+            }
+
+            if (!TryPositive(CellText(row, ColDrawerUnit), out var unit, allowBlank: true))
+            {
+                problem = $"'{name}': Unit must be 1 or 2.";
+                return false;
+            }
+
+            var destination = new Destination
             {
                 Name = name,
                 Queue = queue,
@@ -633,11 +778,144 @@ public sealed class SettingsForm : Form
                 DotWidth = dots,
                 RenderDpi = dpi > 0 ? dpi : Destination.DefaultRenderDpi,
                 PaperSizeName = Blank(CellText(row, ColPaperForm)),
-                Enabled = row.Cells[0].Value is true
-            });
+                Enabled = row.Cells[0].Value is true,
+                DrawerCommand = drawerCommand,
+                DrawerPulseMs = drawerCommand is null || pulse <= 0 ? null : pulse,
+                DrawerUnit = drawerCommand is null || unit <= 0 ? null : unit
+            };
+
+            // Caught here rather than at the counter. A pulse the command set
+            // cannot express is the fault that presents as "the drawer randomly
+            // does not open", which nobody traces back to a settings dialog.
+            if (drawerCommand is not null && DrawerDispatch.Problem(destination) is { } drawerProblem)
+            {
+                problem = drawerProblem;
+                return false;
+            }
+
+            destinations.Add(destination);
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// Fires the drawer described by this row, right now, without saving.
+    ///
+    /// <para>The point of the button: the command set is <i>declared</i>, never
+    /// detected, and a Star and an Epson disagree about what a pulse byte means.
+    /// Nothing reads a reply from the printer, so the only proof the declaration
+    /// is right is a drawer that opens.</para>
+    /// </summary>
+    private void TestDrawer(DataGridViewRow row)
+    {
+        var name = CellText(row, ColName).Trim();
+        var shown = string.IsNullOrWhiteSpace(name) ? "this destination" : name;
+
+        var queue = CellText(row, ColQueue).Trim();
+        if (string.Equals(queue, NoPrinter, StringComparison.OrdinalIgnoreCase)) queue = "";
+
+        if (string.IsNullOrWhiteSpace(queue))
+        {
+            Say($"'{shown}' has no printer assigned. Pick one first — the drawer is wired into it.",
+                MessageBoxIcon.Information);
+            return;
+        }
+
+        if (!PrinterQueues.Exists(queue))
+        {
+            Say($"The queue '{queue}' is not installed on this PC.", MessageBoxIcon.Warning);
+            return;
+        }
+
+        TryPositive(CellText(row, ColDrawerPulse), out var pulse, allowBlank: true);
+        TryPositive(CellText(row, ColDrawerUnit), out var unit, allowBlank: true);
+
+        var probe = new Destination
+        {
+            Name = shown,
+            Queue = queue,
+            DrawerCommand = DrawerCommandFromLabel(CellText(row, ColDrawerCmd)),
+            DrawerPulseMs = pulse > 0 ? pulse : null,
+            DrawerUnit = unit > 0 ? unit : null
+        };
+
+        if (DrawerDispatch.Problem(probe) is { } problem)
+        {
+            Say(problem, MessageBoxIcon.Warning);
+            return;
+        }
+
+        var set = PrinterCommandSets.For(probe)!;
+        var bytes = set.KickDrawer(probe.EffectiveDrawerPulseMs, probe.EffectiveDrawerUnit).ToArray();
+
+        var previous = Cursor;
+        Cursor = Cursors.WaitCursor;
+        string? error;
+        try { error = RawPrinter.Send(queue, bytes, "MaplePrint — open cash drawer"); }
+        finally { Cursor = previous; }
+
+        // Recorded like any other open. An audit trail with the setup tests
+        // missing has a hole in it exactly where somebody would look first.
+        Audit(probe, error);
+
+        if (error is not null)
+        {
+            Say(error, MessageBoxIcon.Warning);
+            return;
+        }
+
+        Say($"{set.Title} — a {probe.EffectiveDrawerPulseMs}ms pulse on unit {probe.EffectiveDrawerUnit} "
+          + $"went to {Shorten(queue)}." + Environment.NewLine + Environment.NewLine
+          + "That only means the printer accepted the bytes." + Environment.NewLine + Environment.NewLine
+          + "The drawer should have opened. If nothing moved, the printer speaks the other command "
+          + "set — change it and press this again. If it clicked but stayed shut, its latch needs a "
+          + "longer pulse: try 250 or 300.",
+            MessageBoxIcon.Information);
+    }
+
+    private void Audit(Destination probe, string? error)
+    {
+        try
+        {
+            new DrawerAudit(JsonSettingsStore.FolderPath).Write(new DrawerAuditEntry(
+                DateTimeOffset.Now,
+                _stationName.Text.Trim(),
+                probe.Name,
+                probe.Queue,
+                error is null ? DrawerAudit.Opened : DrawerAudit.Failed,
+                CommandSet: probe.DrawerCommand,
+                PulseMs: probe.EffectiveDrawerPulseMs,
+                Unit: probe.EffectiveDrawerUnit,
+                Reason: "test:setup",
+                Error: error));
+        }
+        catch
+        {
+            // A settings dialog must not fail over a log line.
+        }
+    }
+
+    private static void Say(string message, MessageBoxIcon icon) =>
+        MessageBox.Show(message, "MaplePrint", MessageBoxButtons.OK, icon);
+
+    private static string Shorten(string value) =>
+        value.Length <= 40 ? value : value[..37] + "…";
+
+    /// <summary>How a stored destination reads in the Drawer command column.</summary>
+    private static string DrawerLabel(Destination d) =>
+        PrinterCommandSets.For(d.DrawerCommand)?.Title ?? NoDrawer;
+
+    /// <summary>The Drawer command column back into what a destination stores,
+    /// or null for "(none)" and anything unrecognised — both of which mean no
+    /// drawer.</summary>
+    private static string? DrawerCommandFromLabel(string label)
+    {
+        if (string.IsNullOrWhiteSpace(label) || string.Equals(label, NoDrawer, StringComparison.Ordinal))
+            return null;
+
+        return PrinterCommandSets.All
+            .FirstOrDefault(c => string.Equals(c.Title, label, StringComparison.Ordinal))?.Name;
     }
 
     /// <summary>How a stored destination reads in the Kind column.</summary>

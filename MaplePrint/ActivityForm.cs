@@ -1,4 +1,4 @@
-using System.Runtime.Versioning;
+﻿using System.Runtime.Versioning;
 using MaplePrint.Diagnostics;
 using MaplePrint.Printing;
 using MaplePrint.Settings;
@@ -41,7 +41,7 @@ public sealed class ActivityForm : Form
             HorizontalScrollbar = true
         };
 
-        // Measured, not sized in pixels. Six buttons of hand-picked widths fit
+        // Measured, not sized in pixels. Seven buttons of hand-picked widths fit
         // at one font scale and clip at the next — which is what a button
         // reading "See a" instead of "See a label…" was.
         var bottom = new FlowLayoutPanel
@@ -61,6 +61,7 @@ public sealed class ActivityForm : Form
         var seeLabel = Footer("See a label…");
         var savedJobs = Footer("Saved jobs");
         var printImage = Footer("Print an image…");
+        var printerCommand = Footer("Printer commands…");
 
         close.Click += (_, _) => Close();
         copy.Click += (_, _) => CopyAll();
@@ -71,6 +72,7 @@ public sealed class ActivityForm : Form
         // usually the one that printed thirty seconds ago.
         seeLabel.Click += (_, _) => ShowRecentLabels(seeLabel);
         printImage.Click += (_, _) => ChooseImageTarget(printImage);
+        printerCommand.Click += (_, _) => ChooseCommandTarget(printerCommand);
 
         bottom.Controls.Add(close);
         bottom.Controls.Add(openFile);
@@ -78,6 +80,7 @@ public sealed class ActivityForm : Form
         bottom.Controls.Add(seeLabel);
         bottom.Controls.Add(savedJobs);
         bottom.Controls.Add(printImage);
+        bottom.Controls.Add(printerCommand);
 
         Controls.Add(_list);
         Controls.Add(bottom);
@@ -362,6 +365,149 @@ public sealed class ActivityForm : Form
 
         _log.Error($"Sending {name} to {destination.Name} failed: {error}");
         MessageBox.Show(error, "MaplePrint", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+    }
+
+    /// <summary>
+    /// Which printer to work on, and what to ask it to do, as a menu under the
+    /// button.
+    ///
+    /// <para>Only raw destinations are offered — a document destination is
+    /// driven through a Windows driver and has no command language to speak to.
+    /// What each one is offered comes from <see cref="PrinterCommands.For"/>, so
+    /// a ZPL printer gets the ZPL commands and a receipt printer gets
+    /// <c>ESC @</c> without this menu knowing either language.</para>
+    /// </summary>
+    private void ChooseCommandTarget(Control anchor)
+    {
+        var menu = new ContextMenuStrip();
+        var targets = _settings.Destinations
+            .Where(d => d.Kind == DestinationKind.Raw)
+            .ToList();
+
+        if (targets.Count == 0)
+        {
+            menu.Items.Add(new ToolStripMenuItem("No raw destinations are set up") { Enabled = false });
+            menu.Show(anchor, new Point(0, -menu.PreferredSize.Height));
+            return;
+        }
+
+        foreach (var destination in targets)
+        {
+            // Captured per iteration; the handlers must not close over the loop
+            // variables' final values.
+            var target = destination;
+            var item = new ToolStripMenuItem($"{target.Name}  ({Shorten(target.Queue)})");
+            var separated = false;
+
+            foreach (var command in PrinterCommands.For(target))
+            {
+                var chosen = command;
+
+                // The commands that cost something sit below a line, so the one
+                // that discards a shop's settings is not the neighbour of the
+                // one that prints a label. A confirmation still follows; this is
+                // so the click is deliberate before it is confirmed.
+                if (chosen.Confirm && !separated)
+                {
+                    item.DropDownItems.Add(new ToolStripSeparator());
+                    separated = true;
+                }
+
+                item.DropDownItems.Add(
+                    $"{chosen.Title}  ({chosen.Detail})",
+                    null,
+                    (_, _) => SendCommand(target, chosen));
+            }
+
+            menu.Items.Add(item);
+        }
+
+        menu.Show(anchor, new Point(0, -menu.PreferredSize.Height));
+    }
+
+    /// <summary>
+    /// Sends one command to a printer.
+    ///
+    /// <para>What this replaces is the afternoon it was written after: a Zebra
+    /// stuck in diagnostics mode printing hex, a shop with nobody on site, and
+    /// the fix being three bytes that had to be delivered by hand-writing a curl
+    /// against the right station, port, destination and content type. All four
+    /// of those are known here already.</para>
+    ///
+    /// <para>Down the same <see cref="RawPrinter"/> path a real job takes, for
+    /// the reason the whole diagnostic side of this app now follows: a shortcut
+    /// that skips a stage cannot see a fault in the stage it skipped.</para>
+    /// </summary>
+    private void SendCommand(Destination destination, PrinterCommand command)
+    {
+        if (!destination.IsConfigured)
+        {
+            MessageBox.Show(
+                $"'{destination.Name}' has no printer assigned. Set one in Settings first.",
+                "MaplePrint", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        if (!PrinterQueues.Exists(destination.Queue))
+        {
+            MessageBox.Show(
+                $"The queue '{destination.Queue}' is not installed on this PC.",
+                "MaplePrint", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        // What is lost, then the question — and defaulting to No, because the
+        // hand that reached this menu was looking for a printer that works, and
+        // the wrong item here costs a shop its darkness and width settings.
+        if (command.Confirm)
+        {
+            var answer = MessageBox.Show(
+                $"{command.Title} on {destination.Name} ({Shorten(destination.Queue)}).\n\n"
+                + command.Consequence + "\n\n"
+                + "Send it?",
+                "MaplePrint", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+
+            if (answer != DialogResult.Yes)
+            {
+                _log.Info($"{command.Title} ({command.Detail}) to {destination.Name} was not confirmed.");
+                return;
+            }
+        }
+
+        // The command is logged by name and by bytes. A printer that ignores it
+        // leaves no other trace, so this line is the only evidence that it was
+        // ever sent — and the next person will want to know exactly what went.
+        _log.Info($"Sending {command.Detail} ({command.Title}) to {destination.Name} ({destination.Queue}).");
+
+        var previous = Cursor;
+        Cursor = Cursors.WaitCursor;
+        string? error;
+        try
+        {
+            error = RawPrinter.Send(destination.Queue, command.Bytes, $"MaplePrint — {command.Title}");
+        }
+        finally
+        {
+            Cursor = previous;
+        }
+
+        if (error is not null)
+        {
+            _log.Error($"Sending {command.Detail} to {destination.Name} failed: {error}");
+            MessageBox.Show(error, "MaplePrint", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        _log.Success($"Sent {command.Detail} -> {destination.Name} ({destination.Queue}).");
+
+        // Spooled is not obeyed. Nothing here reads a reply, so the only proof
+        // any of it worked is paper — and saying what to look for is what stops
+        // "it said Success" being mistaken for "it is fixed".
+        MessageBox.Show(
+            $"{command.Detail} was sent to {destination.Name}.\n\n"
+            + "That only means the printer accepted the bytes.\n\n"
+            + command.Afterwards,
+            "MaplePrint", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
     private static string Shorten(string value) =>
