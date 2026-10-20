@@ -1,4 +1,5 @@
 using System.Runtime.Versioning;
+using MaplePrint.Cards;
 using MaplePrint.Diagnostics;
 using MaplePrint.Printing;
 using MaplePrint.Server;
@@ -21,6 +22,8 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly ActivityLog _log;
     private readonly Control _marshal;
     private readonly PrintServer _server;
+    private readonly CardWatcher _cards;
+    private readonly ToolStripMenuItem _cardItem;
 
     /// <summary>
     /// How long Exit waits for the server to drain before leaving anyway. Long
@@ -31,6 +34,7 @@ public sealed class TrayApplicationContext : ApplicationContext
 
     private AppSettings _settings;
     private ActivityForm? _activityForm;
+    private CardCheckForm? _cardCheckForm;
 
     public TrayApplicationContext()
     {
@@ -62,8 +66,13 @@ public sealed class TrayApplicationContext : ApplicationContext
         _server = new PrintServer(_settings, _log);
         _server.StateChanged += OnStateChanged;
 
+        _cards = new CardWatcher(_settings, _log);
+        _cardItem = new ToolStripMenuItem(_cards.Status) { Enabled = false };
+        _cards.StatusChanged += status => BeginInvokeOnUi(() => _cardItem.Text = status);
+
         var menu = new ContextMenuStrip();
         menu.Items.Add(_statusItem);
+        menu.Items.Add(_cardItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Copy server &address", null, (_, _) => CopyAddress());
         menu.Items.Add("Copy API &key", null, (_, _) => CopyApiKey());
@@ -72,6 +81,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         menu.Items.Add("&Activity…", null, (_, _) => ShowActivity());
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(_testMenu);
+        menu.Items.Add("Test card &reader…", null, (_, _) => ShowCardCheck());
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Re&start server", null, async (_, _) => await _server.RestartAsync());
         menu.Items.Add(new ToolStripSeparator());
@@ -87,6 +97,7 @@ public sealed class TrayApplicationContext : ApplicationContext
             ContextMenuStrip = menu
         };
         _tray.DoubleClick += (_, _) => ShowActivity();
+        _cards.Missed += message => BeginInvokeOnUi(() => _tray.ShowBalloonTip(5000, "MaplePrint", message, ToolTipIcon.Warning));
 
         _log.Info($"MaplePrint {PrintServer.Version} started.");
 
@@ -97,6 +108,7 @@ public sealed class TrayApplicationContext : ApplicationContext
 
         RebuildTestMenu();
         _ = _server.StartAsync();
+        _cards.Start();
 
         // No printers mapped means every job will be refused, so nudge on first
         // run — but after the server is up, not instead of it.
@@ -189,6 +201,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         _log.Info("Settings saved.");
 
         _server.UpdateSettings(_settings);
+        _cards.UpdateSettings(_settings);
         _ = _server.RestartAsync();
     }
 
@@ -203,6 +216,28 @@ public sealed class TrayApplicationContext : ApplicationContext
         _activityForm = new ActivityForm(_log, _settings);
         _activityForm.FormClosed += (_, _) => _activityForm = null;
         _activityForm.Show();
+    }
+
+    /// <summary>
+    /// Cards are not sent to the shop while the check is open: its test taps would land on a
+    /// counter screen as a customer's card.
+    /// </summary>
+    private void ShowCardCheck()
+    {
+        if (_cardCheckForm is { IsDisposed: false })
+        {
+            _cardCheckForm.Activate();
+            return;
+        }
+
+        var paused = _cards.Pause();
+        _cardCheckForm = new CardCheckForm(_settings);
+        _cardCheckForm.FormClosed += (_, _) =>
+        {
+            paused.Dispose();
+            _cardCheckForm = null;
+        };
+        _cardCheckForm.Show();
     }
 
     /// <summary>
@@ -346,7 +381,9 @@ public sealed class TrayApplicationContext : ApplicationContext
             if (!shutdown.Wait(ShutdownTimeout))
                 _log.Error($"The print server did not shut down within {ShutdownTimeout.TotalSeconds:0}s; exiting anyway.");
 
+            _cards.Dispose();
             _activityForm?.Dispose();
+            _cardCheckForm?.Dispose();
             _tray.Dispose();
             _marshal.Dispose();
             _log.Info("MaplePrint stopped.");

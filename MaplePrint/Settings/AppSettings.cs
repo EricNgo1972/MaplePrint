@@ -10,7 +10,8 @@ namespace MaplePrint.Settings;
 ///
 /// Note what is *not* here: any mention of MapleCoffee, or of whoever else
 /// sends jobs. The print server knows about printers and nothing else — callers
-/// are configured with our address, not the other way round.
+/// are configured with our address, not the other way round. The one exception
+/// is the card reader, which has to call out: <see cref="CardShopUrl"/>.
 /// </summary>
 public sealed class AppSettings
 {
@@ -57,6 +58,20 @@ public sealed class AppSettings
     /// sticker.</para>
     /// </summary>
     public bool SaveJobCopies { get; set; }
+
+    /// <summary>
+    /// The Maple shop this PC's USB card reader (an ACR122U or similar) belongs to, as its setup
+    /// page shows it: <c>https://cafe.example.com</c>. Each card laid on the reader is sent there,
+    /// and the shop hands it to every counter screen the reader is attached to — on this PC or any
+    /// other. Blank: cards are read and go nowhere, which is every counter with no card reader.
+    /// </summary>
+    public string CardShopUrl { get; set; } = "";
+
+    /// <summary>
+    /// The key MaplePrint made for itself when the shop was set. Pairing ties it to one of the
+    /// shop's readers, and the shop keeps only its hash — so a new key is a new, unpaired reader.
+    /// </summary>
+    public string CardDeviceKey { get; set; } = "";
 
     /// <summary>Per-window size and position, keyed by form name.</summary>
     public Dictionary<string, WindowPlacement> WindowPlacements { get; set; } = new();
@@ -153,4 +168,26 @@ public sealed class AppSettings
     /// </summary>
     public static string NewApiKey() =>
         Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
+
+    /// <summary>True when card reads have somewhere to go.</summary>
+    [JsonIgnore]
+    public bool HasCardShop => !string.IsNullOrEmpty(CardShopUrl) && !string.IsNullOrEmpty(CardDeviceKey);
+
+    /// <summary>A card reader's key: 32 random bytes, URL-safe, as the shop's phone readers make them.</summary>
+    public static string NewCardDeviceKey() =>
+        Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+
+    /// <summary>
+    /// The shop's address as typed, made into one MaplePrint can call: HTTPS when no scheme is
+    /// given (a shop's public address is HTTPS), no query, no trailing slash. Null when it isn't one.
+    /// </summary>
+    public static string? NormalizeShopUrl(string? typed)
+    {
+        var text = (typed ?? "").Trim().TrimEnd('/');
+        if (text.Length == 0) return null;
+        if (!text.Contains("://", StringComparison.Ordinal)) text = "https://" + text;
+        return Uri.TryCreate(text, UriKind.Absolute, out var uri) && uri.Scheme is "http" or "https" && uri.Host.Length > 0
+            ? uri.GetLeftPart(UriPartial.Path).TrimEnd('/')
+            : null;
+    }
 }

@@ -30,6 +30,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="MaplePrint.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- Shipped inside the .exe so Help works on a counter PC with no internet —
          which is the state it is most likely to be opened in. -->
     <EmbeddedResource Include="..\README.md" LogicalName="MaplePrint.README.md" />

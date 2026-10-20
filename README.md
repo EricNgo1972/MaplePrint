@@ -7,6 +7,7 @@ them to the printers attached to that PC, and reports what happened.
 - Lives in the notification area; no main window
 - Knows nothing about who is calling it
 - Opens the cash drawer wired to a receipt printer, per job
+- Sends each card laid on a USB card reader to the Maple shop it is paired with
 
 ## What it is for
 
@@ -436,6 +437,44 @@ drawer.
   queue. The endpoint type exists in the code but is not implemented; the trigger
   to build it is the hardware check above finding that futurePRNT intercepts RAW
   jobs, which would leave LAN units needing a way round the driver.
+
+## Card reader
+
+A USB contactless reader (an ACS ACR122U, or any PC/SC reader) plugged into this
+PC becomes one of a Maple shop's card readers. Windows installs its driver by
+itself; it shows under *Smart card readers* in Device Manager, not as a keyboard.
+
+Each card laid on it is sent to the shop, and the shop hands it to every counter
+screen the reader is attached to — the browser on this PC, a tablet at the till,
+anywhere. Nothing is typed into the window in front. One tap is one read: the
+card must be lifted off before it counts again.
+
+### Setting one up
+
+1. On the shop's **Card readers** setup page, add a *USB card reader on a counter
+   PC*. The page shows the shop's address.
+2. Here: **Settings → Card reader → Shop address**, type that address, **Save**.
+3. Right-click MaplePrint's icon. The card reader line shows a six-digit code.
+4. Enter the code on the setup page, then test with one of the shop's cards and
+   attach the reader to its counter.
+
+The tray line then reads *paired as "Front counter"*. **Pair again** in Settings
+gives this PC a new key, which the shop sees as a new, unpaired reader; so does
+changing the shop's address. Blank the address on a PC with no reader.
+
+### When a tap goes nowhere
+
+A balloon says so at the PC, and Activity keeps a line: the reader isn't paired,
+no counter screen was waiting for a card, or the shop couldn't be reached. The
+shop doesn't hold a tap for later — open the card screen, then tap again.
+
+### Checking the reader
+
+**Test card reader…** on the tray menu: finds the reader, reads a card, checks
+the same card gives the same ID twice (that ID is the card's key at the shop),
+on an NTAG writes a test link and puts back what the card held, and asks the
+shop whether this reader is paired. Cards are not sent to the shop while it is
+open. What it showed is saved to `%TEMP%\mapleprint-cardcheck.txt`.
 
 ## Setup
 
