@@ -1,4 +1,4 @@
-using System.Text.Json.Serialization;
+﻿using System.Text.Json.Serialization;
 
 namespace MaplePrint.Settings;
 
@@ -92,6 +92,54 @@ public sealed class Destination
     public bool Enabled { get; set; } = true;
 
     /// <summary>
+    /// Which command set fires the cash drawer wired into this printer's DK
+    /// port — <c>star</c> or <c>escpos</c>, per <see cref="DrawerCommands"/>.
+    ///
+    /// <para><b>Blank means there is no drawer</b>, which is every destination
+    /// until somebody sets one up. Emptiness is the flag deliberately: a
+    /// separate "drawer enabled" switch would create a second way to say the
+    /// same thing, and a state where a drawer is configured but off is one more
+    /// thing to get wrong at a counter. Same idea as a blank <see cref="Queue"/>
+    /// meaning "not finished being set up".</para>
+    ///
+    /// <para>Declared, never sniffed. A Star and an Epson disagree about what a
+    /// pulse byte means, so a wrong guess here is a till that opens
+    /// intermittently — which reads as a faulty drawer, not as a setting.</para>
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? DrawerCommand { get; set; }
+
+    /// <summary>
+    /// How long the solenoid is driven, in <b>milliseconds</b> — never in
+    /// device units, because those differ per command set. 200 ms suits most
+    /// drawers; some need 250–300 ms to release the latch.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? DrawerPulseMs { get; set; }
+
+    /// <summary>
+    /// Which peripheral the printer drives: 1 (the usual single drawer) or 2 (a
+    /// second drawer, if one is fitted). Configurable, but nothing in the app
+    /// builds a workflow around a second drawer.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? DrawerUnit { get; set; }
+
+    /// <summary>The default pulse. Long enough for the common latch, short
+    /// enough not to sound like a fault.</summary>
+    public const int DefaultDrawerPulseMs = 200;
+
+    /// <summary>True when a drawer is wired to this printer and set up.</summary>
+    [JsonIgnore]
+    public bool HasDrawer => !string.IsNullOrWhiteSpace(DrawerCommand);
+
+    [JsonIgnore]
+    public int EffectiveDrawerPulseMs => DrawerPulseMs is > 0 ? DrawerPulseMs.Value : DefaultDrawerPulseMs;
+
+    [JsonIgnore]
+    public int EffectiveDrawerUnit => DrawerUnit == 2 ? 2 : 1;
+
+    /// <summary>
     /// JsonIgnore because System.Text.Json serializes get-only properties, and
     /// a computed value written into the settings file reads as a setting.
     /// </summary>
@@ -104,6 +152,20 @@ public static class DestinationNames
 {
     public const string Receipt = "receipt";
     public const string Label = "label";
+}
+
+/// <summary>
+/// The command sets that can fire a cash drawer, as stored in
+/// <c>settings.json</c>. Strings rather than an enum, matching
+/// <see cref="PrinterLanguages"/> and letting blank mean "no drawer".
+/// </summary>
+public static class DrawerCommands
+{
+    /// <summary>Star native — TSP100 / TSP143III.</summary>
+    public const string Star = "star";
+
+    /// <summary>Epson ESC/POS, and the many clones of it.</summary>
+    public const string EscPos = "escpos";
 }
 
 public static class PrinterLanguages
@@ -119,4 +181,66 @@ public static class DotWidths
 
     /// <summary>2.20″ printable at 203 dpi — Zebra LP 2824 and friends.</summary>
     public const int Label2Inch = 448;
+}
+
+/// <summary>One roll of paper, named the way the box it came in is.</summary>
+public sealed record PaperWidth(string Name, int DotsAt203Dpi);
+
+/// <summary>
+/// The paper an operator can actually identify, so that setting a destination up
+/// is answering "what is loaded?" rather than "how many dots across is the
+/// printable area?".
+///
+/// <para>Dots remain the stored truth — they are what callers are told and what
+/// decides the artwork's physical size (<c>pixels ÷ RenderDpi</c>). This is a
+/// shortcut that fills them in, not a replacement: an odd printer can still have
+/// its width typed straight in.</para>
+///
+/// <para>Held at 203 dpi, the resolution of nearly every thermal printer, and
+/// scaled for the rest. Receipt figures are the industry ones (576 / 384) rather
+/// than derived, because those are what the drivers and every other POS assume;
+/// labels are simply their width times the resolution.</para>
+/// </summary>
+public static class PaperWidths
+{
+    /// <summary>Shown when the width matches no known roll. Selecting it changes
+    /// nothing — it means "leave the dots alone".</summary>
+    public const string Custom = "Custom…";
+
+    public static readonly PaperWidth[] All =
+    [
+        new("80 mm receipt", DotWidths.Receipt80mm),
+        new("58 mm receipt", 384),
+        new("2″ label", 406),
+        new("2.2″ label", DotWidths.Label2Inch),
+        new("3″ label", 609),
+        new("4″ label", 812),
+    ];
+
+    private static int Scale(int dotsAt203, int dpi) =>
+        dpi is <= 0 or Destination.DefaultRenderDpi
+            ? dotsAt203
+            : (int)Math.Round(dotsAt203 * (dpi / (double)Destination.DefaultRenderDpi));
+
+    /// <summary>Dots for a named roll at this resolution, or null for
+    /// <see cref="Custom"/> and anything unrecognised.</summary>
+    public static int? DotsFor(string? name, int dpi)
+    {
+        var paper = All.FirstOrDefault(
+            p => string.Equals(p.Name, name, StringComparison.OrdinalIgnoreCase));
+        return paper is null ? null : Scale(paper.DotsAt203Dpi, dpi);
+    }
+
+    /// <summary>The roll a width corresponds to, for showing an existing
+    /// destination as the paper it is rather than as a number.</summary>
+    public static string NameFor(int dots, int dpi)
+    {
+        if (dots <= 0) return Custom;
+
+        foreach (var paper in All)
+            if (Scale(paper.DotsAt203Dpi, dpi) == dots)
+                return paper.Name;
+
+        return Custom;
+    }
 }

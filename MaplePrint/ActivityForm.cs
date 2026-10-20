@@ -1,5 +1,7 @@
-using System.Runtime.Versioning;
+﻿using System.Runtime.Versioning;
 using MaplePrint.Diagnostics;
+using MaplePrint.Printing;
+using MaplePrint.Settings;
 
 namespace MaplePrint;
 
@@ -7,16 +9,23 @@ namespace MaplePrint;
 /// A live view of what the agent has been doing. This is the window a manager
 /// opens when a customer says their receipt never printed — it answers "did the
 /// job arrive at all?", which is the fork that decides who to call.
+///
+/// <para>The saved-job tools live here rather than on the tray menu. They
+/// answer the next question after that fork — "it arrived, but did it come out
+/// right?" — and a tray menu earns its place by staying short enough to read at
+/// a glance.</para>
 /// </summary>
 [SupportedOSPlatform("windows")]
 public sealed class ActivityForm : Form
 {
     private readonly ActivityLog _log;
+    private readonly AppSettings _settings;
     private readonly ListBox _list;
 
-    public ActivityForm(ActivityLog log)
+    public ActivityForm(ActivityLog log, AppSettings settings)
     {
         _log = log;
+        _settings = settings;
 
         Text = "MaplePrint — Activity";
         Width = 900;
@@ -32,29 +41,56 @@ public sealed class ActivityForm : Form
             HorizontalScrollbar = true
         };
 
+        // Measured, not sized in pixels. Seven buttons of hand-picked widths fit
+        // at one font scale and clip at the next — which is what a button
+        // reading "See a" instead of "See a label…" was.
         var bottom = new FlowLayoutPanel
         {
             Dock = DockStyle.Bottom,
             FlowDirection = FlowDirection.RightToLeft,
-            Height = 44,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            WrapContents = false,
             Padding = new Padding(8)
         };
 
-        var close = new Button { Text = "Close", Width = 90, DialogResult = DialogResult.Cancel };
-        var openFile = new Button { Text = "Open log file", Width = 110 };
-        var copy = new Button { Text = "Copy all", Width = 90 };
+        var close = Footer("Close");
+        close.DialogResult = DialogResult.Cancel;
+        var openFile = Footer("Open log file");
+        var copy = Footer("Copy all");
+        var seeLabel = Footer("See a label…");
+        var savedJobs = Footer("Saved jobs");
+        var printImage = Footer("Print an image…");
+        var printerCommand = Footer("Printer commands…");
 
         close.Click += (_, _) => Close();
         copy.Click += (_, _) => CopyAll();
         openFile.Click += (_, _) => OpenLogFile();
+        savedJobs.Click += (_, _) => ShowSavedJobs();
+
+        // The list is built as it drops, not once: the label worth looking at is
+        // usually the one that printed thirty seconds ago.
+        seeLabel.Click += (_, _) => ShowRecentLabels(seeLabel);
+        printImage.Click += (_, _) => ChooseImageTarget(printImage);
+        printerCommand.Click += (_, _) => ChooseCommandTarget(printerCommand);
 
         bottom.Controls.Add(close);
         bottom.Controls.Add(openFile);
         bottom.Controls.Add(copy);
+        bottom.Controls.Add(seeLabel);
+        bottom.Controls.Add(savedJobs);
+        bottom.Controls.Add(printImage);
+        bottom.Controls.Add(printerCommand);
 
         Controls.Add(_list);
         Controls.Add(bottom);
         CancelButton = close;
+
+        // The window may not be allowed to get narrower than its own buttons.
+        // Measured for the same reason they are: five of them at a large font
+        // scale need more room than any number typed here would have guessed.
+        var needed = bottom.PreferredSize.Width + (Width - ClientSize.Width) + 16;
+        MinimumSize = new Size(Math.Max(MinimumSize.Width, needed), MinimumSize.Height);
 
         foreach (var entry in _log.Snapshot()) _list.Items.Add(entry.ToString());
         ScrollToEnd();
@@ -62,6 +98,18 @@ public sealed class ActivityForm : Form
         _log.Appended += OnAppended;
         FormClosed += (_, _) => _log.Appended -= OnAppended;
     }
+
+    /// <summary>A footer button that is as wide as its own text, with a minimum
+    /// so short labels don't come out cramped beside long ones.</summary>
+    private static Button Footer(string text) => new()
+    {
+        Text = text,
+        AutoSize = true,
+        AutoSizeMode = AutoSizeMode.GrowAndShrink,
+        MinimumSize = new Size(84, 0),
+        Padding = new Padding(10, 4, 10, 4),
+        Margin = new Padding(4, 3, 4, 3)
+    };
 
     private void OnAppended(ActivityEntry entry)
     {
@@ -88,6 +136,411 @@ public sealed class ActivityForm : Form
         if (_list.Items.Count == 0) return;
         var text = string.Join(Environment.NewLine, _list.Items.Cast<object>().Select(i => i.ToString()));
         try { Clipboard.SetText(text); } catch { }
+    }
+
+    /// <summary>
+    /// The last few labels, as a menu under the button. Five, because this is a
+    /// "what just happened" tool — anything older is a job for the folder.
+    /// </summary>
+    private void ShowRecentLabels(Control anchor)
+    {
+        var menu = new ContextMenuStrip();
+        var recent = JobArchive.RecentLabels(5);
+
+        if (recent.Count == 0)
+        {
+            var why = _settings.SaveJobCopies
+                ? "No labels printed yet"
+                : "Turn on saving jobs in Settings first";
+            menu.Items.Add(new ToolStripMenuItem(why) { Enabled = false });
+        }
+        else
+        {
+            foreach (var file in recent)
+            {
+                // Captured per iteration; the handler must not close over the
+                // loop variable's final value.
+                var path = file.FullName;
+                var kind = file.Extension.Equals(".zpl", StringComparison.OrdinalIgnoreCase)
+                    ? "label"
+                    : "page";
+                menu.Items.Add(
+                    $"{file.LastWriteTime:HH:mm:ss}  {DestinationOf(file.Name)}  ({kind})",
+                    null,
+                    async (_, _) => await ShowLabelAsync(path));
+            }
+        }
+
+        menu.Show(anchor, new Point(0, -menu.PreferredSize.Height));
+    }
+
+    /// <summary>The destination out of a saved job's file name, which is stamped
+    /// "20260731-144512-345-label.zpl".</summary>
+    private static string DestinationOf(string fileName)
+    {
+        var stem = Path.GetFileNameWithoutExtension(fileName);
+        var dash = stem.LastIndexOf('-');
+        return dash >= 0 && dash < stem.Length - 1 ? stem[(dash + 1)..] : stem;
+    }
+
+    /// <summary>
+    /// Renders one saved label and opens the picture. The job leaves this PC to
+    /// be drawn, so it happens only here, on a button somebody pressed — never
+    /// as a side effect of printing.
+    /// </summary>
+    private async Task ShowLabelAsync(string zplFile)
+    {
+        try
+        {
+            // A rendered page is already a picture — open it rather than sending
+            // it somewhere to be drawn.
+            if (Path.GetExtension(zplFile).Equals(".png", StringComparison.OrdinalIgnoreCase))
+            {
+                using var image = System.Diagnostics.Process.Start(
+                    new System.Diagnostics.ProcessStartInfo(zplFile) { UseShellExecute = true });
+                return;
+            }
+
+            var dpi = _settings.Destinations
+                .FirstOrDefault(d => string.Equals(
+                    d.Name, DestinationOf(Path.GetFileName(zplFile)), StringComparison.OrdinalIgnoreCase))
+                ?.RenderDpi ?? 0;
+
+            var png = await LabelPreview.RenderAsync(zplFile, dpi);
+
+            using var viewer = System.Diagnostics.Process.Start(
+                new System.Diagnostics.ProcessStartInfo(png) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                $"Could not draw that label.\n\n{ex.Message}\n\n"
+                + "Drawing it needs an internet connection — the label is rendered by labelary.com.",
+                "MaplePrint",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+        }
+    }
+
+    /// <summary>
+    /// Which destination to send a picked image to, as a menu under the button.
+    ///
+    /// <para>Only <c>document</c> destinations are offered. A raw one is waiting
+    /// for ESC/POS or ZPL, and a bitmap spooled to it ejects pages of nonsense —
+    /// the mistake the server answers with a 415, and there is no reason for a
+    /// button here to be able to make it.</para>
+    /// </summary>
+    private void ChooseImageTarget(Control anchor)
+    {
+        var menu = new ContextMenuStrip();
+        var targets = _settings.Destinations
+            .Where(d => d.Kind == DestinationKind.Document)
+            .ToList();
+
+        if (targets.Count == 0)
+        {
+            menu.Items.Add(new ToolStripMenuItem("No document destinations are set up") { Enabled = false });
+        }
+        else
+        {
+            foreach (var destination in targets)
+            {
+                // Captured per iteration; the handler must not close over the
+                // loop variable's final value.
+                var target = destination;
+                menu.Items.Add(
+                    $"{target.Name}  ({Shorten(target.Queue)})",
+                    null,
+                    (_, _) => PrintPickedImage(target));
+            }
+        }
+
+        menu.Show(anchor, new Point(0, -menu.PreferredSize.Height));
+    }
+
+    /// <summary>
+    /// Prints an image the operator picks — a saved job, or any PNG dropped in
+    /// the folder — to <paramref name="destination"/>.
+    ///
+    /// <para>The point of it is the fault it was written for: a receipt arrived
+    /// from the caller intact and came out of the printer clipped, and proving
+    /// that meant re-running a real order every time. Now the payload on disk
+    /// can be sent again on its own, as many times as it takes, with no till and
+    /// no customer involved.</para>
+    ///
+    /// <para>Deliberately the same two calls a job off the network makes —
+    /// <see cref="ImageDecoder.Decode"/> then <see cref="DocumentPrinter.Print"/>
+    /// — rather than a shortcut to the printer. A diagnostic that skips a stage
+    /// is blind to the stage it skipped: the tray's own test print composes its
+    /// bitmap in memory and never decodes anything, and that is precisely why it
+    /// kept coming out perfect while every real job was mangled. This one has to
+    /// be able to reproduce the fault, so it takes the whole path.</para>
+    /// </summary>
+    private void PrintPickedImage(Destination destination)
+    {
+        if (!destination.IsConfigured)
+        {
+            MessageBox.Show(
+                $"'{destination.Name}' has no printer assigned. Set one in Settings first.",
+                "MaplePrint", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        if (!PrinterQueues.Exists(destination.Queue))
+        {
+            MessageBox.Show(
+                $"The queue '{destination.Queue}' is not installed on this PC.",
+                "MaplePrint", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        using var picker = new OpenFileDialog
+        {
+            Title = $"Send an image to {destination.Name}",
+            Filter = "Images (*.png;*.jpg;*.jpeg;*.bmp)|*.png;*.jpg;*.jpeg;*.bmp|All files (*.*)|*.*",
+            CheckFileExists = true
+        };
+
+        // Opens where the jobs land, because the file somebody wants to send
+        // again is almost always the one that just went wrong.
+        if (Directory.Exists(JobArchive.Folder)) picker.InitialDirectory = JobArchive.Folder;
+
+        if (picker.ShowDialog(this) != DialogResult.OK) return;
+
+        var path = picker.FileName;
+        var name = Path.GetFileName(path);
+
+        byte[] payload;
+        try
+        {
+            payload = File.ReadAllBytes(path);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Could not read {name}: {ex.Message}", "MaplePrint",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        var (image, decodeError) = ImageDecoder.Decode(payload);
+        if (image is null)
+        {
+            _log.Error($"Could not send {name} to {destination.Name}: {decodeError}");
+            MessageBox.Show(decodeError, "MaplePrint", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        string? error;
+        using (image)
+        {
+            // Says what it is before it says how big, so the log shows whether
+            // the artwork matched the destination it was sent to — which is the
+            // first thing to check when a page comes out the wrong size.
+            _log.Info($"Sending {name} ({image.Width}x{image.Height} at {destination.RenderDpi} dpi) "
+                    + $"to {destination.Name}.");
+
+            // Spooling blocks — DocumentPrinter joins its own STA thread — so
+            // the window would otherwise sit there looking hung.
+            var previous = Cursor;
+            Cursor = Cursors.WaitCursor;
+            try
+            {
+                error = DocumentPrinter.Print(
+                    destination.Queue, image, $"MaplePrint — {name}",
+                    paperSizeName: destination.PaperSizeName,
+                    renderDpi: destination.RenderDpi,
+                    note: _log.Info);
+            }
+            finally
+            {
+                Cursor = previous;
+            }
+        }
+
+        if (error is null)
+        {
+            _log.Success($"Sent {name} -> {destination.Name} ({destination.Queue}).");
+            return;
+        }
+
+        _log.Error($"Sending {name} to {destination.Name} failed: {error}");
+        MessageBox.Show(error, "MaplePrint", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+    }
+
+    /// <summary>
+    /// Which printer to work on, and what to ask it to do, as a menu under the
+    /// button.
+    ///
+    /// <para>Only raw destinations are offered — a document destination is
+    /// driven through a Windows driver and has no command language to speak to.
+    /// What each one is offered comes from <see cref="PrinterCommands.For"/>, so
+    /// a ZPL printer gets the ZPL commands and a receipt printer gets
+    /// <c>ESC @</c> without this menu knowing either language.</para>
+    /// </summary>
+    private void ChooseCommandTarget(Control anchor)
+    {
+        var menu = new ContextMenuStrip();
+        var targets = _settings.Destinations
+            .Where(d => d.Kind == DestinationKind.Raw)
+            .ToList();
+
+        if (targets.Count == 0)
+        {
+            menu.Items.Add(new ToolStripMenuItem("No raw destinations are set up") { Enabled = false });
+            menu.Show(anchor, new Point(0, -menu.PreferredSize.Height));
+            return;
+        }
+
+        foreach (var destination in targets)
+        {
+            // Captured per iteration; the handlers must not close over the loop
+            // variables' final values.
+            var target = destination;
+            var item = new ToolStripMenuItem($"{target.Name}  ({Shorten(target.Queue)})");
+            var separated = false;
+
+            foreach (var command in PrinterCommands.For(target))
+            {
+                var chosen = command;
+
+                // The commands that cost something sit below a line, so the one
+                // that discards a shop's settings is not the neighbour of the
+                // one that prints a label. A confirmation still follows; this is
+                // so the click is deliberate before it is confirmed.
+                if (chosen.Confirm && !separated)
+                {
+                    item.DropDownItems.Add(new ToolStripSeparator());
+                    separated = true;
+                }
+
+                item.DropDownItems.Add(
+                    $"{chosen.Title}  ({chosen.Detail})",
+                    null,
+                    (_, _) => SendCommand(target, chosen));
+            }
+
+            menu.Items.Add(item);
+        }
+
+        menu.Show(anchor, new Point(0, -menu.PreferredSize.Height));
+    }
+
+    /// <summary>
+    /// Sends one command to a printer.
+    ///
+    /// <para>What this replaces is the afternoon it was written after: a Zebra
+    /// stuck in diagnostics mode printing hex, a shop with nobody on site, and
+    /// the fix being three bytes that had to be delivered by hand-writing a curl
+    /// against the right station, port, destination and content type. All four
+    /// of those are known here already.</para>
+    ///
+    /// <para>Down the same <see cref="RawPrinter"/> path a real job takes, for
+    /// the reason the whole diagnostic side of this app now follows: a shortcut
+    /// that skips a stage cannot see a fault in the stage it skipped.</para>
+    /// </summary>
+    private void SendCommand(Destination destination, PrinterCommand command)
+    {
+        if (!destination.IsConfigured)
+        {
+            MessageBox.Show(
+                $"'{destination.Name}' has no printer assigned. Set one in Settings first.",
+                "MaplePrint", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        if (!PrinterQueues.Exists(destination.Queue))
+        {
+            MessageBox.Show(
+                $"The queue '{destination.Queue}' is not installed on this PC.",
+                "MaplePrint", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        // What is lost, then the question — and defaulting to No, because the
+        // hand that reached this menu was looking for a printer that works, and
+        // the wrong item here costs a shop its darkness and width settings.
+        if (command.Confirm)
+        {
+            var answer = MessageBox.Show(
+                $"{command.Title} on {destination.Name} ({Shorten(destination.Queue)}).\n\n"
+                + command.Consequence + "\n\n"
+                + "Send it?",
+                "MaplePrint", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+
+            if (answer != DialogResult.Yes)
+            {
+                _log.Info($"{command.Title} ({command.Detail}) to {destination.Name} was not confirmed.");
+                return;
+            }
+        }
+
+        // The command is logged by name and by bytes. A printer that ignores it
+        // leaves no other trace, so this line is the only evidence that it was
+        // ever sent — and the next person will want to know exactly what went.
+        _log.Info($"Sending {command.Detail} ({command.Title}) to {destination.Name} ({destination.Queue}).");
+
+        var previous = Cursor;
+        Cursor = Cursors.WaitCursor;
+        string? error;
+        try
+        {
+            error = RawPrinter.Send(destination.Queue, command.Bytes, $"MaplePrint — {command.Title}");
+        }
+        finally
+        {
+            Cursor = previous;
+        }
+
+        if (error is not null)
+        {
+            _log.Error($"Sending {command.Detail} to {destination.Name} failed: {error}");
+            MessageBox.Show(error, "MaplePrint", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        _log.Success($"Sent {command.Detail} -> {destination.Name} ({destination.Queue}).");
+
+        // Spooled is not obeyed. Nothing here reads a reply, so the only proof
+        // any of it worked is paper — and saying what to look for is what stops
+        // "it said Success" being mistaken for "it is fixed".
+        MessageBox.Show(
+            $"{command.Detail} was sent to {destination.Name}.\n\n"
+            + "That only means the printer accepted the bytes.\n\n"
+            + command.Afterwards,
+            "MaplePrint", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
+    private static string Shorten(string value) =>
+        value.Length <= 34 ? value : value[..31] + "…";
+
+    /// <summary>
+    /// Opens the folder saved jobs land in. Says so plainly when the setting is
+    /// off rather than opening an empty folder, which would read as "nothing
+    /// printed" instead of "nothing was being kept".
+    /// </summary>
+    private void ShowSavedJobs()
+    {
+        if (!_settings.SaveJobCopies && !Directory.Exists(JobArchive.Folder))
+        {
+            MessageBox.Show(
+                "Jobs aren't being saved. Turn on \"Keep a copy of each job for troubleshooting\" "
+                + "in Settings, print something, then look here again.",
+                "MaplePrint",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+
+        try
+        {
+            Directory.CreateDirectory(JobArchive.Folder);
+            using var explorer = System.Diagnostics.Process.Start(
+                new System.Diagnostics.ProcessStartInfo(JobArchive.Folder) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Could not open {JobArchive.Folder}: {ex.Message}", "MaplePrint");
+        }
     }
 
     private void OpenLogFile()

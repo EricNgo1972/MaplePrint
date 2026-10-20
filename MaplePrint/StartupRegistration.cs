@@ -42,16 +42,49 @@ public static class StartupRegistration
         }
     }
 
-    public static bool IsEnabled()
+    public static bool IsEnabled() => RegisteredCommand() is not null;
+
+    /// <summary>The command line currently registered, or null if there is none.</summary>
+    public static string? RegisteredCommand()
     {
         try
         {
             using var key = Registry.CurrentUser.OpenSubKey(RunKey);
-            return key?.GetValue(ValueName) is not null;
+            return key?.GetValue(ValueName) as string;
         }
         catch
         {
-            return false;
+            return null;
         }
+    }
+
+    /// <summary>
+    /// Make the registry agree with the setting at every start, rather than only
+    /// when someone opens the Settings dialog.
+    ///
+    /// <para>Two ordinary things break an entry written once. MaplePrint ships as
+    /// a single .exe that people copy into place, so an upgrade often lands in a
+    /// different folder and leaves the old path registered; and cleanup tools
+    /// prune <c>Run</c> keys. Either way the shop discovers it the morning after
+    /// a reboot, when nothing prints and the one thing nobody suspects is the
+    /// thing that did not start.</para>
+    ///
+    /// <para>Self-heals in the enabled direction only. An entry someone added by
+    /// hand is theirs, and removing it because our settings file happens to say
+    /// false would be us overruling them.</para>
+    /// </summary>
+    /// <returns>True if the entry was written or corrected.</returns>
+    public static bool Reconcile(bool enabled)
+    {
+        if (!enabled) return false;
+
+        var exe = Environment.ProcessPath;
+        if (string.IsNullOrWhiteSpace(exe)) return false;
+
+        if (string.Equals(RegisteredCommand(), $"\"{exe}\"", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        Apply(true);
+        return true;
     }
 }

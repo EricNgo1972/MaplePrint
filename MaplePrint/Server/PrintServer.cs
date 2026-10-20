@@ -1,5 +1,4 @@
-using System.Collections.Concurrent;
-using System.Net;
+﻿using System.Net;
 using System.Runtime.Versioning;
 using System.Security.Cryptography;
 using System.Text;
@@ -30,34 +29,36 @@ public enum ServerState { Stopped, Starting, Listening, Faulted }
 [SupportedOSPlatform("windows")]
 public sealed class PrintServer : IAsyncDisposable
 {
-    /// <summary>
-    /// A job that outlives this has hit a driver prompt or a powered-off
-    /// printer. Answer the caller rather than holding its request open.
-    /// </summary>
-    private static readonly TimeSpan SpoolTimeout = TimeSpan.FromSeconds(30);
-
-    /// <summary>How long to wait for the printer ahead of us in the queue.</summary>
-    private static readonly TimeSpan QueueWaitTimeout = TimeSpan.FromSeconds(45);
-
     /// <summary>A receipt is a few kB and a label less. Anything this large is a mistake.</summary>
     private const int MaxPayloadBytes = 8 * 1024 * 1024;
 
     private readonly ActivityLog _log;
 
+    /// <summary>The append-only record of every drawer open. A record, not a gate.</summary>
+    private readonly DrawerAudit _drawerAudit;
+
     /// <summary>
-    /// One gate per Windows queue. Two jobs interleaved on one printer produce
-    /// half of each receipt, and a shop that prints from two tills at once will
-    /// find that out at the worst moment.
+    /// Which jobs have already opened the drawer, so a retry reprints without
+    /// reopening the till.
     /// </summary>
-    private readonly ConcurrentDictionary<string, SemaphoreSlim> _queueGates = new(StringComparer.OrdinalIgnoreCase);
+    private readonly DrawerKickLedger _kicks = new();
+
+    /// <summary>
+    /// One queue per printer, one consumer draining each. Two jobs interleaved
+    /// on one printer produce half of each receipt, and a shop that prints from
+    /// two tills at once will find that out at the worst moment.
+    /// </summary>
+    private readonly PrintDispatcher _dispatcher;
 
     private WebApplication? _app;
     private AppSettings _settings;
 
-    public PrintServer(AppSettings settings, ActivityLog log)
+    public PrintServer(AppSettings settings, ActivityLog log, DrawerAudit? drawerAudit = null)
     {
         _settings = settings;
         _log = log;
+        _drawerAudit = drawerAudit ?? new DrawerAudit(Path.GetDirectoryName(log.FilePath)!, log);
+        _dispatcher = new PrintDispatcher(ExecuteJobAsync);
     }
 
     public ServerState State { get; private set; } = ServerState.Stopped;
@@ -82,6 +83,21 @@ public sealed class PrintServer : IAsyncDisposable
             return;
         }
 
+        // A drawer set up wrong must say so now, not at the counter during a
+        // sale. Nothing else in a print server has a failure this quiet: the
+        // receipt prints, the till simply does not open.
+        var drawerProblems = _settings.Destinations
+            .Where(d => d.HasDrawer)
+            .Select(DrawerDispatch.Problem)
+            .Where(problem => problem is not null)
+            .ToList();
+
+        if (drawerProblems.Count > 0)
+        {
+            SetState(ServerState.Faulted, string.Join(" ", drawerProblems));
+            return;
+        }
+
         // All interfaces only when the operator has asked for it. Binding
         // everything by default would quietly put a printer on the shop wifi.
         var bindAddress = _settings.AllowRemote ? IPAddress.Any : IPAddress.Loopback;
@@ -96,6 +112,13 @@ public sealed class PrintServer : IAsyncDisposable
             // console, and it only wants what a shop would act on.
             builder.Logging.ClearProviders();
             builder.WebHost.ConfigureKestrel(options => options.Listen(bindAddress, _settings.ListenPort));
+
+            // A tray app has no console to Ctrl-C and no SIGTERM to catch, but
+            // the default console lifetime hooks AppDomain.ProcessExit anyway
+            // and blocks there waiting on a host it believes is still running.
+            // On Exit that is the difference between a closed application and
+            // one still sitting in Task Manager.
+            builder.Services.AddSingleton<IHostLifetime, NoHostLifetime>();
 
             var app = builder.Build();
             MapEndpoints(app);
@@ -154,11 +177,19 @@ public sealed class PrintServer : IAsyncDisposable
         {
             if (!Authorized(ctx)) return Unauthorized();
 
-            if (string.IsNullOrWhiteSpace(request.PayloadBase64))
+            // Empty is legal only for a no-sale: openDrawer with nothing to
+            // print. Without that flag this is the same refusal it always was,
+            // so a caller written before drawers existed sees no change.
+            if (string.IsNullOrWhiteSpace(request.PayloadBase64) && !request.OpenDrawer)
                 return Fail(400, JobId(request.JobId), request.DestinationName, null, "payloadBase64 is required.");
 
             byte[] payload;
-            try { payload = Convert.FromBase64String(request.PayloadBase64); }
+            try
+            {
+                payload = string.IsNullOrWhiteSpace(request.PayloadBase64)
+                    ? []
+                    : Convert.FromBase64String(request.PayloadBase64);
+            }
             catch (FormatException)
             {
                 return Fail(400, JobId(request.JobId), request.DestinationName, null,
@@ -171,7 +202,8 @@ public sealed class PrintServer : IAsyncDisposable
 
             return await ExecuteAsync(
                 request.DestinationName, request.ContentType, payload,
-                request.Description, request.JobId, request.Copies);
+                request.Description, request.JobId, request.Copies,
+                request.OpenDrawer, request.Reason, request.User);
         });
 
         // Raw form: POST the bytes themselves. Exists so a technician can prove
@@ -180,8 +212,17 @@ public sealed class PrintServer : IAsyncDisposable
         {
             if (!Authorized(ctx)) return Unauthorized();
 
+            // Headers rather than a body, because this endpoint's body is the
+            // payload. A no-sale here is an empty POST with the drawer header,
+            // which is what makes the whole path provable with one curl.
+            var openDrawer = IsTrue(ctx.Request.Headers["X-MaplePrint-Open-Drawer"]);
+
             var payload = await ReadBodyAsync(ctx);
             if (payload is null)
+                return Fail(400, JobId(null), destination, null,
+                    $"Body was larger than {MaxPayloadBytes / 1024}kB.");
+
+            if (payload.Length == 0 && !openDrawer)
                 return Fail(400, JobId(null), destination, null,
                     $"Body was empty or larger than {MaxPayloadBytes / 1024}kB.");
 
@@ -191,7 +232,10 @@ public sealed class PrintServer : IAsyncDisposable
                 payload,
                 ctx.Request.Headers["X-MaplePrint-Description"],
                 ctx.Request.Headers["X-MaplePrint-Job-Id"],
-                copies: 1);
+                copies: 1,
+                openDrawer,
+                ctx.Request.Headers["X-MaplePrint-Reason"],
+                ctx.Request.Headers["X-MaplePrint-User"]);
         });
     }
 
@@ -208,18 +252,30 @@ public sealed class PrintServer : IAsyncDisposable
             d.DotWidth,
             d.RenderDpi,
             queues.Any(q => string.Equals(q, d.Queue, StringComparison.OrdinalIgnoreCase)),
-            d.Enabled)).ToList();
+            d.Enabled,
+            d.HasDrawer
+                ? new DrawerInfo(d.DrawerCommand!.Trim().ToLowerInvariant(), d.EffectiveDrawerPulseMs, d.EffectiveDrawerUnit)
+                : null)).ToList();
 
         return Results.Ok(new DestinationsResponse(_settings.StationName, destinations, queues));
     }
 
-    /// <summary>Resolve, validate, serialise, spool, answer. The whole job.</summary>
+    /// <summary>Resolve, validate, queue, spool, answer. The whole job.</summary>
     private async Task<IResult> ExecuteAsync(
         string? destinationName, string? contentType, byte[] payload,
-        string? description, string? jobId, int copies)
+        string? description, string? jobId, int copies,
+        bool openDrawer = false, string? reason = null, string? user = null)
     {
         var id = JobId(jobId);
+        var callerSuppliedJobId = !string.IsNullOrWhiteSpace(jobId);
         var label = string.IsNullOrWhiteSpace(description) ? (destinationName ?? "job") : description!;
+        var drawerOnly = payload.Length == 0 && openDrawer;
+
+        // A job that asks for nothing at all. Refused rather than quietly
+        // succeeding, because a caller that sent it has a bug and wants to know.
+        if (payload.Length == 0 && !openDrawer)
+            return Refuse(400, id, destinationName, null, label,
+                "A job must carry a payload, open the drawer, or both.");
 
         var destination = _settings.Find(destinationName);
         if (destination is null)
@@ -238,7 +294,8 @@ public sealed class PrintServer : IAsyncDisposable
         var expected = ExpectedContentType(destination);
         var actual = string.IsNullOrWhiteSpace(contentType) ? expected : contentType!.Trim().ToLowerInvariant();
 
-        if (actual != expected)
+        // A no-sale carries no content, so there is nothing to disagree about.
+        if (!drawerOnly && actual != expected)
             return Refuse(415, id, destination.Name, destination.Queue, label, MismatchMessage(destination, actual, expected));
 
         if (copies is < 1 or > 99)
@@ -256,53 +313,177 @@ public sealed class PrintServer : IAsyncDisposable
             return Refuse(404, id, destination.Name, destination.Queue, label,
                 $"The queue '{destination.Queue}' is not installed on this PC.");
 
-        // One printer, one job at a time.
-        var gate = _queueGates.GetOrAdd(destination.Queue, _ => new SemaphoreSlim(1, 1));
-        if (!await gate.WaitAsync(QueueWaitTimeout))
+        // Asking a printer with no drawer to open one is configuration, not
+        // policy — the same shape of refusal as a destination with no queue.
+        if (openDrawer && DrawerDispatch.Problem(destination) is { } drawerProblem)
+        {
+            AuditDrawer(destination, DrawerAudit.Refused, id, user, reason, drawerProblem);
+            return Refuse(409, id, destination.Name, destination.Queue, label, drawerProblem);
+        }
+
+        var job = new PrintJob
+        {
+            DeviceKey = new PrinterEndpoint.WindowsQueue(destination.Queue).DeviceKey,
+            DeviceLabel = destination.Queue,
+            Destination = destination,
+            ContentType = actual,
+            Payload = payload,
+            OpenDrawer = openDrawer,
+            JobId = id,
+            CallerSuppliedJobId = callerSuppliedJobId,
+            Label = label,
+            Copies = copies,
+            User = string.IsNullOrWhiteSpace(user) ? null : user!.Trim(),
+            Reason = Because(reason, drawerOnly, user)
+        };
+
+        var result = await _dispatcher.DispatchAsync(job);
+
+        if (result.Outcome == DispatchOutcome.Busy)
             return Refuse(503, id, destination.Name, destination.Queue, label,
-                $"'{destination.Queue}' is still busy with an earlier job.");
+                result.Error ?? $"'{destination.Queue}' is still busy with an earlier job.");
 
-        try
+        var error = result.Error;
+
+        if (error is null)
         {
-            var error = await SpoolAsync(destination, actual, payload, label, copies);
-
-            if (error is null)
-            {
-                _log.Success($"Printed {label} -> {destination.Name} ({destination.Queue}, {payload.Length} bytes).");
-                return Results.Ok(new PrintResponse(id, true, destination.Name, destination.Queue));
-            }
-
-            _log.Error($"Failed {label} -> {destination.Name}: {error}");
-
-            // 502: we understood the request, the device let us down. Lets a
-            // caller distinguish "retry me" from "your request was wrong" (4xx).
-            return Fail(502, id, destination.Name, destination.Queue, error);
+            _log.Success(Describe(job));
+            return Results.Ok(new PrintResponse(id, true, destination.Name, destination.Queue,
+                DrawerOpened: job.DrawerOpened));
         }
-        finally
-        {
-            gate.Release();
-        }
+
+        _log.Error($"Failed {label} -> {destination.Name}: {error}");
+
+        // 502: we understood the request, the device let us down. Lets a
+        // caller distinguish "retry me" from "your request was wrong" (4xx).
+        //
+        // Except for a no-sale. A re-printed receipt wastes a slip; a re-kicked
+        // drawer is a till standing open with nobody in front of it. This one
+        // goes to a person, not round the retry loop.
+        return Results.Json(
+            new PrintResponse(id, false, destination.Name, destination.Queue, error,
+                DrawerOpened: job.DrawerOpened,
+                Retryable: drawerOnly ? false : null),
+            statusCode: 502);
     }
 
-    private async Task<string?> SpoolAsync(Destination destination, string contentType, byte[] payload, string label, int copies)
+    /// <summary>
+    /// What one job actually does at the printer, run by that printer's single
+    /// consumer. Nothing else is touching this device while this runs.
+    /// </summary>
+    private async Task<string?> ExecuteJobAsync(PrintJob job, CancellationToken ct)
     {
+        var destination = job.Destination;
+
         try
         {
-            // Spooling blocks; keep it off the request thread so a wedged driver
-            // can't starve the whole listener.
-            var work = Task.Run(() => contentType == ContentTypes.Image
-                ? PrintImage(destination, payload, label, copies)
-                : RawPrinter.Send(destination.Queue, payload, label));
+            // Before spooling, so a job that the driver then rejects is still on
+            // disk to look at — that is the case worth having a copy of.
+            if (_settings.SaveJobCopies && job.Payload.Length > 0 &&
+                JobArchive.Save(destination, job.ContentType, job.Payload, DateTime.Now) is { } saved)
+                _log.Info($"Saved a copy of {job.Label} to {saved}");
 
-            var finished = await Task.WhenAny(work, Task.Delay(SpoolTimeout));
-            return finished == work
-                ? await work
-                : $"'{destination.Queue}' did not accept the job within {SpoolTimeout.TotalSeconds:0}s.";
+            var commandSet = job.OpenDrawer ? PrinterCommandSets.For(destination) : null;
+
+            // Claimed before anything is sent, deliberately. A kick that went out
+            // and a payload that then failed is a drawer that opened, and the
+            // retry must not open it twice — so a partial write counts as
+            // already-opened, which is the safe direction to be wrong in.
+            if (commandSet is not null && !_kicks.TryClaim(job.CallerSuppliedJobId ? job.JobId : null))
+            {
+                commandSet = null;
+                _log.Info($"{job.Label}: job {job.JobId} already opened the drawer; reprinting without it.");
+                AuditDrawer(destination, DrawerAudit.Suppressed, job.JobId, job.User, job.Reason, null);
+            }
+
+            var sends = DrawerDispatch.Plan(
+                destination, commandSet, job.ContentType, job.Payload, job.OpenDrawer);
+
+            foreach (var send in sends)
+            {
+                var error = send.Kind == SendKind.Image
+                    ? await Task.Run(() => PrintImage(destination, send.Bytes, job.Label, job.Copies), ct)
+                    : await SendRawAsync(destination, send.Bytes, job.Label, ct);
+
+                if (send.ContainsKick)
+                {
+                    job.DrawerOpened = error is null;
+                    AuditDrawer(
+                        destination,
+                        error is null ? DrawerAudit.Opened : DrawerAudit.Failed,
+                        job.JobId, job.User, job.Reason, error);
+                }
+
+                if (error is not null) return error;
+            }
+
+            return null;
         }
         catch (Exception ex)
         {
             return ex.Message;
         }
+    }
+
+    /// <summary>
+    /// Device bytes to the printer, through the transport seam. RAW datatype,
+    /// so they reach the printer's own command parser rather than the driver's
+    /// renderer — which is what lets a drawer kick work on a raster-only printer
+    /// whose receipts go out as rendered pages.
+    /// </summary>
+    private static async Task<string?> SendRawAsync(
+        Destination destination, byte[] bytes, string label, CancellationToken ct)
+    {
+        var (transport, problem) = PrinterTransports.For(new PrinterEndpoint.WindowsQueue(destination.Queue));
+        return transport is null ? problem : await transport.SendAsync(bytes, label, ct);
+    }
+
+    /// <summary>
+    /// What to record this open as. The caller's own words when it sent any —
+    /// they know the order number and we do not. Otherwise the one thing we can
+    /// see for ourselves: paper moved, or it did not. A blank line in the audit
+    /// is the one that cannot be answered later, and "no-sale opens by employee"
+    /// is exactly the question this file exists for.
+    /// </summary>
+    private static string Because(string? reason, bool drawerOnly, string? user)
+    {
+        if (!string.IsNullOrWhiteSpace(reason)) return reason!.Trim();
+        if (!drawerOnly) return "sale";
+
+        return string.IsNullOrWhiteSpace(user) ? "no-sale" : $"no-sale:{user!.Trim()}";
+    }
+
+    private void AuditDrawer(
+        Destination destination, string outcome, string jobId, string? user, string? reason, string? error)
+    {
+        var set = PrinterCommandSets.For(destination.DrawerCommand);
+
+        _drawerAudit.Write(new DrawerAuditEntry(
+            DateTimeOffset.Now,
+            _settings.StationName,
+            destination.Name,
+            destination.Queue,
+            outcome,
+            CommandSet: set?.Name,
+            PulseMs: destination.HasDrawer ? destination.EffectiveDrawerPulseMs : null,
+            Unit: destination.HasDrawer ? destination.EffectiveDrawerUnit : null,
+            User: user,
+            Reason: reason,
+            JobId: jobId,
+            Error: error));
+    }
+
+    private static string Describe(PrintJob job)
+    {
+        var what = job.Payload.Length == 0
+            ? "Opened the drawer on"
+            : $"Printed {job.Label} ->";
+
+        var drawer = job.Payload.Length > 0 && job.DrawerOpened ? ", drawer opened" : "";
+
+        return job.Payload.Length == 0
+            ? $"{what} {job.Destination.Name} ({job.Destination.Queue})."
+            : $"{what} {job.Destination.Name} ({job.Destination.Queue}, {job.Payload.Length} bytes{drawer}).";
     }
 
     private string? PrintImage(Destination destination, byte[] payload, string label, int copies)
@@ -324,7 +505,9 @@ public sealed class PrintServer : IAsyncDisposable
     {
         using var buffer = new MemoryStream();
         await ctx.Request.Body.CopyToAsync(buffer);
-        if (buffer.Length == 0 || buffer.Length > MaxPayloadBytes) return null;
+        // Null means too large. Empty is a real answer now — it is what a
+        // drawer-only job looks like — so the endpoint decides what to make of it.
+        if (buffer.Length > MaxPayloadBytes) return null;
         return buffer.ToArray();
     }
 
@@ -407,6 +590,17 @@ public sealed class PrintServer : IAsyncDisposable
     private static IResult Unauthorized() =>
         Results.Json(new { error = "A valid X-MaplePrint-Key is required." }, statusCode: 401);
 
+    /// <summary>
+    /// A header meaning yes. Generous about how it is spelled, because this one
+    /// is typed by hand in a curl as often as it is set by a program.
+    /// </summary>
+    private static bool IsTrue(string? value) =>
+        value is not null &&
+        value.Trim() is var v &&
+        (v.Equals("true", StringComparison.OrdinalIgnoreCase) ||
+         v.Equals("yes", StringComparison.OrdinalIgnoreCase) ||
+         v == "1");
+
     private static string JobId(string? supplied) =>
         string.IsNullOrWhiteSpace(supplied) ? Guid.NewGuid().ToString("n") : supplied!.Trim();
 
@@ -442,5 +636,21 @@ public sealed class PrintServer : IAsyncDisposable
         StateChanged?.Invoke(state, reason);
     }
 
-    public async ValueTask DisposeAsync() => await StopAsync();
+    public async ValueTask DisposeAsync()
+    {
+        await StopAsync().ConfigureAwait(false);
+        await _dispatcher.DisposeAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Nothing to wait for on the way up and nothing to hook on the way down.
+    /// Who decides when this process ends is the tray menu, not the host. See
+    /// <see cref="StartAsync"/>.
+    /// </summary>
+    private sealed class NoHostLifetime : IHostLifetime
+    {
+        public Task WaitForStartAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+    }
 }
