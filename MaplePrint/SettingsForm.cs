@@ -55,6 +55,8 @@ public sealed class SettingsForm : Form
     private readonly CheckBox _allowRemote = new() { Text = "Accept jobs from other machines on the network", AutoSize = true };
     private readonly CheckBox _startWithWindows = new() { Text = "Start MaplePrint when I sign in", AutoSize = true };
     private readonly CheckBox _saveJobCopies = new() { Text = "Keep a copy of each job for troubleshooting", AutoSize = true };
+    private readonly TextBox _cardShopUrl = new();
+    private readonly Label _cardPairing = new() { AutoSize = true, ForeColor = SystemColors.GrayText };
     private readonly DataGridView _grid = new();
 
     /// <summary>Below this the grid stops being usable, so the dialog refuses to get shorter.</summary>
@@ -63,6 +65,9 @@ public sealed class SettingsForm : Form
     private readonly List<Label> _hints = [];
     private readonly TableLayoutPanel _layout;
     private readonly AppSettings _original;
+
+    /// <summary>Set by Pair again: Save gives the reader a new key, and the shop shows it as a new reader.</summary>
+    private bool _newCardKey;
 
     private int _row;
     private int _gridRow = -1;
@@ -94,6 +99,8 @@ public sealed class SettingsForm : Form
         _allowRemote.Checked = current.AllowRemote;
         _startWithWindows.Checked = current.StartWithWindows || StartupRegistration.IsEnabled();
         _saveJobCopies.Checked = current.SaveJobCopies;
+        _cardShopUrl.Text = current.CardShopUrl;
+        _cardShopUrl.PlaceholderText = "blank — no card reader here, e.g. cafe.example.com";
 
         BuildGrid(current);
 
@@ -507,6 +514,14 @@ public sealed class SettingsForm : Form
         AddSpanning(_grid, grow: true);
         AddSpanning(GridButtons());
 
+        Section("Card reader");
+        Field("Shop address", _cardShopUrl);
+        AddSpanning(CardButtons());
+        Hint("A USB card reader (an ACR122U or similar) plugged into this PC. Each card laid on it "
+           + "is sent to the shop, which hands it to the counter screens this reader is attached "
+           + "to — on this PC or any other. Type the address the shop's card readers setup page "
+           + "shows, Save, then enter the code MaplePrint's menu shows on that page.");
+
         Section("Security");
         Field("API key", _apiKey);
         AddSpanning(KeyButtons());
@@ -632,6 +647,29 @@ public sealed class SettingsForm : Form
         return host;
     }
 
+    private Control CardButtons()
+    {
+        var host = new FlowLayoutPanel
+        {
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Padding = Padding.Empty,
+            Margin = new Padding(LabelColumnWidth, 2, 0, 0)
+        };
+
+        var pairAgain = new Button { Text = "Pair again", AutoSize = true, Margin = new Padding(0, 0, 10, 0) };
+        pairAgain.Click += (_, _) =>
+        {
+            _newCardKey = true;
+            _cardPairing.Text = "After Save, the shop sees a new, unpaired reader with a new code.";
+        };
+        _cardPairing.Margin = new Padding(0, 6, 0, 0);
+
+        host.Controls.Add(pairAgain);
+        host.Controls.Add(_cardPairing);
+        return host;
+    }
+
     private Control BuildFooter()
     {
         var save = new Button { Text = "Save", AutoSize = true, MinimumSize = new Size(88, 28), DialogResult = DialogResult.OK };
@@ -689,6 +727,16 @@ public sealed class SettingsForm : Form
             return;
         }
 
+        var typedShop = _cardShopUrl.Text.Trim();
+        var shop = AppSettings.NormalizeShopUrl(typedShop);
+        if (typedShop.Length > 0 && shop is null)
+        {
+            MessageBox.Show($"'{typedShop}' is not a web address. Type the shop's address as its card readers setup page shows it.",
+                "MaplePrint", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            DialogResult = DialogResult.None;
+            return;
+        }
+
         Result = new AppSettings
         {
             ListenPort = (int)_listenPort.Value,
@@ -698,12 +746,27 @@ public sealed class SettingsForm : Form
             Destinations = destinations,
             StartWithWindows = _startWithWindows.Checked,
             SaveJobCopies = _saveJobCopies.Checked,
+            CardShopUrl = shop ?? "",
+            CardDeviceKey = CardKeyFor(shop),
 
             // The same dictionary instance, not a copy: this runs before
             // FormClosing captures the final geometry, and sharing the reference
             // is what lets that later write reach the object we hand back.
             WindowPlacements = _original.WindowPlacements
         };
+    }
+
+    /// <summary>
+    /// The reader keeps its key — and so its pairing — unless it is asked to pair again or moved to
+    /// another shop. No shop, no key: there is nothing for one to pair with.
+    /// </summary>
+    private string CardKeyFor(string? shop)
+    {
+        if (shop is null) return "";
+        var sameShop = string.Equals(shop, _original.CardShopUrl, StringComparison.OrdinalIgnoreCase);
+        return sameShop && !_newCardKey && !string.IsNullOrEmpty(_original.CardDeviceKey)
+            ? _original.CardDeviceKey
+            : AppSettings.NewCardDeviceKey();
     }
 
     private bool TryReadDestinations(out List<Destination> destinations, out string problem)

@@ -5,6 +5,12 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
+
+using MaplePrint.Cards;
 using MaplePrint.Printing;
 using MaplePrint.Server;
 using MaplePrint.Settings;
@@ -24,7 +30,10 @@ namespace MaplePrint.Diagnostics;
 ///
 /// <para>What is deliberately not here: anything needing hardware. Whether a
 /// TSP143 actually opens its drawer is a question paper and a solenoid answer,
-/// and the README carries that checklist.</para>
+/// and the README carries that checklist. The card reader's hands-on half — a
+/// person laying a card on it — is <see cref="CardCheck"/>, on the tray's menu;
+/// what this checks of it is everything up to the reader: the settings, the
+/// status line, and the two calls to the shop.</para>
 /// </summary>
 public static class SelfTest
 {
@@ -49,6 +58,9 @@ public static class SelfTest
             Compatibility();
             SettingsRoundTrip();
             OldClientOverHttp().GetAwaiter().GetResult();
+            CardSettings();
+            CardStatus();
+            CardsToTheShop().GetAwaiter().GetResult();
         }
         catch (Exception ex)
         {
@@ -461,6 +473,133 @@ public static class SelfTest
         finally
         {
             await server.DisposeAsync();
+        }
+    }
+
+    // ---- the card reader ---------------------------------------------------
+
+    private static void CardSettings()
+    {
+        Section("card reader settings");
+
+        Check("a bare address gets https", AppSettings.NormalizeShopUrl("cafe.example.com") == "https://cafe.example.com");
+        Check("a trailing slash goes", AppSettings.NormalizeShopUrl("https://cafe.example.com/") == "https://cafe.example.com");
+        Check("http is kept for a LAN shop", AppSettings.NormalizeShopUrl("http://192.168.1.5:5000") == "http://192.168.1.5:5000");
+        Check("a query is dropped", AppSettings.NormalizeShopUrl("cafe.example.com/?x=1") == "https://cafe.example.com");
+        Check("blank is no shop", AppSettings.NormalizeShopUrl("  ") is null);
+        Check("an ftp address is refused", AppSettings.NormalizeShopUrl("ftp://cafe.example.com") is null);
+
+        // Every settings file written before the card reader: no shop, so cards go nowhere.
+        var old = JsonSerializer.Deserialize<AppSettings>("""{"listenPort":9110}""", new JsonSerializerOptions(JsonSerializerDefaults.Web))!;
+        Check("an existing install has no card shop", !old.HasCardShop);
+        Check("a shop with no key is no shop", !new AppSettings { CardShopUrl = "https://cafe.example.com" }.HasCardShop);
+
+        var a = AppSettings.NewCardDeviceKey();
+        Check("a reader's key is long enough for the shop (32+)", a.Length >= 32);
+        Check("a reader's key is URL-safe", a.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_'));
+        Check("two readers never share a key", a != AppSettings.NewCardDeviceKey());
+
+        Check("the log shows enough of an ID to tell cards apart", CardWatcher.Masked("37B93304") == "37…04");
+        Check("a short ID is shown whole", CardWatcher.Masked("ABCD") == "ABCD");
+    }
+
+    private static void CardStatus()
+    {
+        Section("card reader status");
+
+        static string S(string? reader, CardWatcher.Shop shop, bool paused = false)
+            => CardWatcher.StatusFor(reader, shop, "482913", "Front counter", paused);
+
+        // Most counters have no card reader; they must not be nagged about a shop.
+        Check("no reader and no shop says only that", S(null, CardWatcher.Shop.NotSet) == "Card reader: none plugged in");
+        Check("a reader with no shop asks for one", S("ACR122U", CardWatcher.Shop.NotSet).Contains("no shop set"));
+        Check("the pairing code is in the menu", S("ACR122U", CardWatcher.Shop.NotPaired).Contains("482913"));
+        Check("the code shows even before the reader is plugged in", S(null, CardWatcher.Shop.NotPaired).Contains("482913"));
+        Check("paired says as what", S("ACR122U", CardWatcher.Shop.Paired).Contains("\"Front counter\""));
+        Check("paired with the reader unplugged says it is unplugged", S(null, CardWatcher.Shop.Paired) == "Card reader: none plugged in");
+        Check("an unreachable shop says so", S("ACR122U", CardWatcher.Shop.Unreachable).Contains("can't reach"));
+        Check("the check says cards are not sent", S("ACR122U", CardWatcher.Shop.Paired, paused: true).Contains("not sent"));
+    }
+
+    /// <summary>
+    /// The two calls, against a stand-in for the shop's <c>/card-reader/api/</c> answering as
+    /// <c>PhoneCardReaderEndpoints</c> does: camelCase, 404 for a reader that isn't paired.
+    /// </summary>
+    private static async Task CardsToTheShop()
+    {
+        Section("card reader, to the shop over HTTP");
+
+        const string pairedKey = "paired-key-0123456789abcdefghijklmnop";
+        const string strangerKey = "unpaired-key-0123456789abcdefghijklmn";
+        var posted = new ConcurrentQueue<JsonElement>();
+
+        WebApplication? shop = null;
+        var port = 0;
+        foreach (var candidate in new[] { 19120, 19121, 19122 })
+        {
+            var builder = WebApplication.CreateSlimBuilder();
+            builder.Logging.ClearProviders();
+            builder.WebHost.ConfigureKestrel(o => o.Listen(IPAddress.Loopback, candidate));
+            var app = builder.Build();
+
+            app.MapPost("/card-reader/api/hello", async (HttpContext ctx) =>
+            {
+                var body = await ctx.Request.ReadFromJsonAsync<JsonElement>();
+                return body.GetProperty("key").GetString() == pairedKey
+                    ? Results.Json(new { paired = true, pairCode = (string?)null, readerName = "Front counter" })
+                    : Results.Json(new { paired = false, pairCode = "482913", readerName = (string?)null });
+            });
+            app.MapPost("/card-reader/api/read", async (HttpContext ctx) =>
+            {
+                var body = await ctx.Request.ReadFromJsonAsync<JsonElement>();
+                if (body.GetProperty("key").GetString() != pairedKey) return Results.NotFound();
+                posted.Enqueue(body.Clone());
+                return Results.Json(new { heard = 2 });
+            });
+
+            try { await app.StartAsync(); shop = app; port = candidate; break; }
+            catch { await app.DisposeAsync(); }
+        }
+
+        if (shop is null)
+        {
+            Fail("start a stand-in shop", "ports 19120-19122 are all in use");
+            return;
+        }
+
+        try
+        {
+            var url = $"http://127.0.0.1:{port}";
+            using var client = new ShopClient();
+
+            var paired = await client.HelloAsync(url, pairedKey, CancellationToken.None);
+            Check("a paired reader learns its name", paired.Paired && paired.ReaderName == "Front counter");
+
+            var stranger = await client.HelloAsync(url, strangerKey, CancellationToken.None);
+            Check("an unpaired reader learns its code", !stranger.Paired && stranger.PairCode == "482913");
+
+            var heard = await client.ReadAsync(url, pairedKey, "37B93304", ["https://cafe.example.com/g/ABC"], CancellationToken.None);
+            Check("a read says how many screens heard it", heard == 2);
+
+            // The mark is what stops an all-digit UID being taken for a stripe number.
+            var sent = posted.TryDequeue(out var body) ? body : default;
+            Check("the chip is sent marked as a chip",
+                sent.ValueKind == JsonValueKind.Object && sent.GetProperty("serial").GetString() == "chip:37B93304");
+            Check("the card's records go with it",
+                sent.ValueKind == JsonValueKind.Object && sent.GetProperty("records")[0].GetString() == "https://cafe.example.com/g/ABC");
+
+            Check("a read from an unpaired reader is null, not an error",
+                await client.ReadAsync(url, strangerKey, "37B93304", [], CancellationToken.None) is null);
+
+            // Nothing listening there: the tray says "can't reach", it does not crash.
+            var unreachable = false;
+            try { await client.HelloAsync("http://127.0.0.1:1", pairedKey, CancellationToken.None); }
+            catch (HttpRequestException ex) { unreachable = ShopClient.Reason(ex) == "no connection"; }
+            Check("a shop that isn't there is \"no connection\"", unreachable);
+        }
+        finally
+        {
+            await shop.DisposeAsync();
         }
     }
 
